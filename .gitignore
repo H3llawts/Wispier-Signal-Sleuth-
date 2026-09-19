@@ -1,0 +1,10 @@
+build/
+.pio/
+secrets.h
+secrets.json
+cfg.txt
+!examples/cfg.txt
+*.csv
+*.log
+*.bin
+

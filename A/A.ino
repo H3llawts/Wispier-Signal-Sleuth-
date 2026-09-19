@@ -1,0 +1,3998 @@
+//Joseph Hewitt 2023
+//This code is for the ESP32 "Side A" of the wardriver hardware revision 3.
+
+const String VERSION = "wispier-0.1.0-dev";
+
+#include <GParser.h>
+#include <MicroNMEA.h>
+#include "FS.h"
+#include "SD.h"
+#include "SPI.h" 
+#include <WiFi.h>
+#include <Preferences.h>
+#include <time.h>
+#include <Update.h>
+#include "mbedtls/sha256.h"
+#include "mbedtls/md.h"
+#include <WiFiClientSecure.h>
+#include <nvs_flash.h>
+
+//Logging library and log tags:
+#include "esp_log.h"
+static const char* LOG_TAG_GENERIC = "wdGeneric";
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 32 // OLED display height, in pixels
+#define OLED_RESET     -1 // Reset pin # (or -1 if sharing Arduino reset pin)
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+#define SD_CS 5 //SD card CS pin.
+#define SPI_FREQ 10000000
+
+//Default baud for inter-ESP32 comms on the PCB (A<->B)
+#define PCB_BAUD_RATE_DEFAULT 115200
+#define PCB_UART_TX_PIN 27
+#define PCB_UART_RX_PIN 14
+unsigned long pcb_baud_rate = 0; //the rate actually in use, loaded automatically.
+boolean reverted_pcb_baud_rate = false;
+unsigned long verified_working_pcb_baud_rate = 0; //set automatically to the latest rate that definitely works
+
+//The pipeline will dynamically replace this value. If you are self-compiling, it is safe to leave it unchanged.
+const String BUILD = "[CI_BUILD_HERE]";
+
+//The stack size is insufficient for the OTA hashing calls. This is 10K, instead of the default 8K.
+SET_LOOP_TASK_STACK_SIZE(10240);
+
+String b_side_hash_full = "unset"; //Set automatically
+
+//These variables are used for buffering/caching GPS data.
+char nmeaBuffer[100];
+MicroNMEA nmea(nmeaBuffer, sizeof(nmeaBuffer));
+unsigned long lastgps = 0;
+String last_lats = "";
+String last_lons = "";
+
+//Automatically set by the OTA update check with the latest version numbers.
+String ota_latest_stable = "";
+String ota_latest_beta = "";
+
+//Automatically set to true if a blocklist was loaded.
+boolean use_blocklist = false;
+//millis() when the last block happened.
+unsigned long ble_block_at = 0;
+unsigned long wifi_block_at = 0;
+
+
+//These variables are used to populate the LCD with statistics.
+float temperature;
+unsigned int ble_count;
+unsigned int count_5ghz;
+unsigned int gsm_count;
+unsigned int wifi_count;
+unsigned int disp_gsm_count;
+unsigned int disp_wifi_count;
+boolean is_5ghz = false;
+unsigned long side_b_reset_millis;
+unsigned long started_at_millis;
+unsigned long total_new_wifi = 0;
+
+uint32_t chip_id;
+
+File filewriter;
+
+Preferences preferences;
+unsigned long bootcount = 0;
+unsigned long booted_at = 0;
+
+String default_ssid = "wardriver.uk";
+const char* default_psk = "wardriver.uk";
+
+/* The recently seen MAC addresses and cell towers are saved into these arrays so that the 
+ * wardriver can detect if they have already been written to the Wigle CSV file.
+ * These _len definitions define how large those arrays should be. Larger is better but consumes more RAM.
+ */
+#define mac_history_len 512
+#define cell_history_len 128
+#define blocklist_len 20
+//Max blocklist entry length. 32 = max SSID len.
+#define blocklist_str_len 32
+//How many file references we are willing to hold from the WiGLE upload history.
+#define wigle_history_len 256
+
+struct mac_addr {
+   unsigned char bytes[6];
+};
+
+struct coordinates {
+  double lat;
+  double lon;
+  int acc;
+};
+
+struct cell_tower {
+  int mcc;
+  int mnc;
+  int lac;
+  int cellid;
+  unsigned long seenat;
+  int strength;
+  struct coordinates pos;
+};
+
+struct block_str {
+  char characters[blocklist_str_len];
+};
+
+//We need a way to reference a file between this device and WiGLE.net.
+//Use the size + file ID (which is just the bootcounter, which can reset and is not unique).
+//We also want some stats from the server.
+struct wigle_file {
+  unsigned long fid;
+  unsigned long fsize;
+  unsigned long discovered_gps;
+  unsigned long total_gps;
+  boolean wait;
+};
+
+struct mac_addr mac_history[mac_history_len];
+unsigned int mac_history_cursor = 0;
+
+struct cell_tower cell_history[cell_history_len];
+unsigned int cell_history_cursor = 0;
+
+struct block_str block_list[blocklist_len];
+
+struct wigle_file wigle_history[wigle_history_len];
+unsigned int wigle_history_cursor = 0;
+
+unsigned long lcd_last_updated;
+
+#define YEAR_2020 1577836800 //epoch value for 1st Jan 2020; dates older than this are considered wrong (this code was written after 2020).
+const char* ntpServer = "pool.ntp.org";
+
+TaskHandle_t primary_scan_loop_handle;
+
+unsigned int b_side_read_failures = 0;
+#define B_SIDE_READ_FAILURES_TOLERATED 10
+#define B_SIDE_READ_BYTE_TIMEOUT 10000
+unsigned long b_side_last_byte_ms = 0;
+boolean b_working = false; //Set to true when we receive some valid data from side B.
+boolean ota_optout = false; //Set in the web interface
+boolean wigle_commercial = false; //Set in the web interface
+boolean wigle_autoupload = false; //Set in the web interface
+String wigle_api_key = ""; //Set in the web interface
+String wigle_username = ""; //Set automatically via API calls
+
+#define DEVICE_UNKNOWN   254
+#define DEVICE_CUSTOM    0
+#define DEVICE_REV3      1
+#define DEVICE_REV3_5    2
+#define DEVICE_REV4      3
+#define DEVICE_REV3_5GM  4
+#define DEVICE_CSF_MINI  5
+byte DEVICE_TYPE = DEVICE_UNKNOWN;
+
+#define HTTP_TIMEOUT_MS 750
+
+//Change these in cfg.txt instead of editing this source code.
+int gps_baud_rate = 9600;
+boolean rotate_display = false;
+boolean block_resets = false;
+boolean block_reconfigure = false;
+int web_timeout = 60000; //ms to spend hosting the web interface before booting.
+int gps_allow_stale_time = 60000;
+boolean enforce_valid_binary_checksums = true; //Lookup OTA binary checksums online, prevent installation if no match found
+boolean nets_over_uart = false; //Send discovered networks over UART?
+String ota_hostname = "ota.wardriver.uk";
+unsigned long auto_reset_ms = 0;
+float force_lat = 0;
+float force_lon = 0;
+boolean sb_bw16 = true; // Wispier includes the BW16; cfg.txt can override.
+boolean scanble = true;  // Bluetooth scan preference
+boolean tempunits_c = false; // Temperature in Celsius by default
+boolean con_ssid_update = false; // update stored WiFi info with cfg.txt values?
+unsigned long pcb_baud_rate_high = 921600;
+
+#define MAX_PCB_BAUD_RATE_HIGH 4000000 //Anything above 4Mhz is likely going to be unreliable, so cap it there.
+#define MAX_AUTO_RESET_MS 1814400000
+#define MIN_AUTO_RESET_MS 7200000
+
+boolean use_fallback_cert = false;
+
+// CERTIFICATES 
+// These certs are used for HTTPS comms to the OTA backend.
+// By hardcoding them, we are asserting trust. CAs are not used.
+// They will be rotated regularly.
+
+static const char *PRIMARY_OTA_CERT = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDeTCCAmGgAwIBAgIUbrbwBJuNsr7DeScXZxaUynePHfowDQYJKoZIhvcNAQEL
+BQAwTDELMAkGA1UEBhMCTkwxCzAJBgNVBAgMAlpIMRUwEwYDVQQKDAx3YXJkcml2
+ZXIudWsxGTAXBgNVBAMMEG90YS53YXJkcml2ZXIudWswHhcNMjMwNjA4MjAwMTQ1
+WhcNMjUwMTI4MjAwMTQ1WjBMMQswCQYDVQQGEwJOTDELMAkGA1UECAwCWkgxFTAT
+BgNVBAoMDHdhcmRyaXZlci51azEZMBcGA1UEAwwQb3RhLndhcmRyaXZlci51azCC
+ASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBANhPWzq8txiMt4IJikuZnNov
+6rAvAM3OicSKofdkOuvNOV6HlVmfzYVNNlESakuloEYRPwF7oxhQEPeU2X2jsQK6
+cCuWrAR2SWPTJ1kk+gNMx7Xq7GOU11wuHFJNRESdOCSCvixCjg/fbMb0Zmt9z/gX
+Rur0Pg/uYEcUgFyJ8KYgDh7m7chCfcFafhQ5RnkXpMINBZX+GmC/BQ57uZhrdTyY
+x5ZnjrLjzvjgLmABRTynCELPDjosfquxW+fHoG48qk4QLMhu/f8JItOce5kmIvS+
+v/766LN2gVK7oYlWjN44Sa/5hlp6Rl2YXGayYOAiivuyr/vniG0xoi2LBe1/WtsC
+AwEAAaNTMFEwHQYDVR0OBBYEFF5wxZNmrWN8/a2a0fAPmJJ/m+OaMB8GA1UdIwQY
+MBaAFF5wxZNmrWN8/a2a0fAPmJJ/m+OaMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZI
+hvcNAQELBQADggEBACpF2qkQd40MLWkMDYaoZFYeZMMt7ktsRAjo6P5HNVAQMdMz
+i9GtYLiXNFyw/Ub0X0JFwZDiqFSKcxJIWx5hgEVTSIvg36ZCRmrP1gmcVtzLbgjG
+oTlYBrUQdeH0KYG+7xMdPJI4+8yc3OXsoZjr4tIlbZJtej6OBipZks645BKUAs3a
+NUVm7tvzg9hEsfPDXXubcK6JLPdNwrnVEmwq6NlKVVHN9McExBumGKnyKYGK8MZF
+KwkScjhM4MVp5+qVrnuZgqkwM0ZOpZ/vAlD6Csv/DplY92nZs1vHSp2RDVHq6IFI
+IY8r4D96F4ocMmptiPuXifjDkGbXPqfnJhwhaMA=
+-----END CERTIFICATE-----
+)EOF";
+
+static const char *FALLBACK_OTA_CERT = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDgTCCAmmgAwIBAgIUPCSsdEWm6C+RS/JoFaREpBmwqMMwDQYJKoZIhvcNAQEL
+BQAwUDELMAkGA1UEBhMCTkwxCzAJBgNVBAgMAlpIMRkwFwYDVQQKDBBvdGEud2Fy
+ZHJpdmVyLnVrMRkwFwYDVQQDDBBvdGEud2FyZHJpdmVyLnVrMB4XDTI0MTAwNTEx
+MDA1MloXDTI1MTAwNTExMDA1MlowUDELMAkGA1UEBhMCTkwxCzAJBgNVBAgMAlpI
+MRkwFwYDVQQKDBBvdGEud2FyZHJpdmVyLnVrMRkwFwYDVQQDDBBvdGEud2FyZHJp
+dmVyLnVrMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsyLzjymRag1m
+esKhQMPEJSM05YvSZYQfh7gIYDmjTbETRkQ530HR2CA9eMF45BjmzZ7Tn3W5rxBE
+kh3uH1YwELgPV0nNCIvoJEAF1vseYqkRH4zFxlqf6hXKrBn8NJ1gmDuDovul86AO
+ahi505xt/2iXXDXjTks0f/HkVkSRiKIOP6V7XluuNBN5nDpESCZ0bglL2dy7qy9O
+LTzN9raX7qLzThjnx69Flc4TFtixk/02taedw8ZH7bedBts3duS/ODMzAipaXIqj
+paEBfFnjfan2A9nLJwHPS7g0Ec4KR3syifLU1ff+N79rHtGCZjnVG9Bn70vYXwA5
+PfxTs+9ctQIDAQABo1MwUTAdBgNVHQ4EFgQU0iKKwPG/hNN5l5K5t7jVsDUmbegw
+HwYDVR0jBBgwFoAU0iKKwPG/hNN5l5K5t7jVsDUmbegwDwYDVR0TAQH/BAUwAwEB
+/zANBgkqhkiG9w0BAQsFAAOCAQEAUky/qKRmIdK0N9n9aSDZLjm3KBHUsr+9BV85
+i9B8LRhfPEq42tTYBdppNatShz5DKwQSW3tzoVJZkWWd/Lz8/K78eTQ1x//rc4cL
+SzjKNiSvx61xJ+WFdczTUmmnAoI4LW83gAUCUOGzZ5PCCiG8h2XRz/C3snN89IN+
+PghVRXsXxN9cE0ZpzGZcnKY0l6x2qNdX92j6RBjrmQ7kKRDaVGswcezCaxy3kgUC
+4Q8nhWv5EzWfwtlY7QZ6WmKwpqWe1PpR7JQz/2wbQDLvJNhDrK+fFk/+8//6ZkgT
+wZj2V+gRCHJi8TgvXDv6rnR/BXSM0Gh/uEXo1Ev5q4YmgUZCVw==
+-----END CERTIFICATE-----
+)EOF";
+
+// END CERTIFICATES
+
+struct wigle_file get_wigle_file(int fid, unsigned long fsize){
+  //Provide a local fileID (numerical bootcounter part only) and the filesize 
+  //Returns a reference to a WiGLE uploaded file, if it has been uploaded. A zero'd object otherwise.
+
+  for (unsigned int cur = 0; cur < wigle_history_len; cur++){
+    if (wigle_history[cur].fid == 0){
+      //We hit an unpopulated entry, meaning we're at the end.
+      break;
+    }
+    if (wigle_history[cur].fid == fid && wigle_history[cur].fsize == fsize){
+      return wigle_history[cur];
+    }
+  }
+
+  //Return the struct with all zeros when we don't have anything.
+  //a fid of zero can't be seen in the wild, so this denotes an invalid/missing response.
+  struct wigle_file wigle_file_reference;
+  wigle_file_reference = (wigle_file){.fid = 0, .fsize = 0, .discovered_gps = 0, .total_gps = 0, .wait = true};
+  return wigle_file_reference;
+}
+
+unsigned long get_epoch(boolean await_valid=false) {
+  //Return epoch from system clock.
+
+  time_t now;
+  struct tm timeinfo;
+  if (await_valid){
+    //This seems to just loop for ~5sec or until the date is valid. Possibly required for NTP?
+    if (!getLocalTime(&timeinfo)) {
+      return(0);
+    }
+  }
+  time(&now);
+  return now;
+}
+
+String dt_string(time_t now=0){
+  //Return a datetime String from a time_t epoch value
+  struct tm ts;
+  char buf[80];
+
+  ts = *localtime(&now);
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ts);
+  String out = String(buf);
+
+  return out;
+}
+
+void wigle_load_history(){
+  wigle_history_cursor = 0;
+  
+  //If authorized, get file uploads from WiGLE and store their references in RAM for later.
+  ESP_LOGD(LOG_TAG_GENERIC, "Will check previous WiGLE uploads");
+  
+  if (!SD.exists("/wigle.crt")){
+    ESP_LOGW(LOG_TAG_GENERIC, "No WiGLE CA cert file!");
+    return;
+  }
+
+  if (wigle_api_key.length() < 3){
+    ESP_LOGD(LOG_TAG_GENERIC, "Not authorized with WiGLE");
+    return;
+  }
+
+  //This block is duplicated also in wigle_upload, refactor some time?
+  //Current root is 1940, double it in case larger certs are used in the future.
+  #define ca_len 3880
+  byte ca_root[ca_len] = {}; // PEM must remain NUL-terminated.
+  ESP_LOGV(LOG_TAG_GENERIC, "Load WiGLE CA");
+  File careader = SD.open("/wigle.crt", FILE_READ);
+  if (careader.size() > ca_len-2){
+    ESP_LOGW(LOG_TAG_GENERIC, "WiGLE CA too large");
+    return;
+  }
+  careader.read(ca_root, ca_len);
+  careader.close();
+  //^
+  
+  clear_display();
+  display.println("Contacting WiGLE");
+  display.display();
+
+
+  WiFiClientSecure httpsclient;
+  httpsclient.setCACert((char*)ca_root);
+
+  if (!httpsclient.connect("api.wigle.net", 443)){
+    ESP_LOGW(LOG_TAG_GENERIC, "WiGLE connection failed");
+    return;
+  }
+  ESP_LOGD(LOG_TAG_GENERIC, "WiGLE connection opened");
+  display.println("Connected");
+  display.display();
+
+  httpsclient.println("GET /api/v2/file/transactions?pagestart=0&pageend=300 HTTP/1.0");
+  httpsclient.println("Host: api.wigle.net");
+  httpsclient.println("Connection: close");
+  httpsclient.print("User-Agent: ");
+  httpsclient.println(generate_user_agent());
+  httpsclient.print("Authorization: Basic ");
+  httpsclient.println(wigle_api_key);
+  httpsclient.println();
+
+  boolean headers = true;
+  String lbuf = "";
+  while (httpsclient.connected()){
+    if (headers){
+      lbuf = httpsclient.readStringUntil('\n');
+      if (lbuf.length() < 3){
+        //Blank line, end of headers.
+        headers = false;
+      }
+    } else {
+      int first_pos = 0;
+      int second_pos = 0;
+      
+      lbuf = httpsclient.readStringUntil('}');
+
+      if (lbuf.indexOf("username") > 0){
+        first_pos = lbuf.indexOf("username\":\"")+11;
+        second_pos = lbuf.indexOf("\"", first_pos);
+        String username = lbuf.substring(first_pos, second_pos);
+        if (username.length() > 2 && username.length() < 33){
+          wigle_username = username;
+          username = "";
+        }
+      }
+      
+      String chip_id_str = String(chip_id);
+      if (lbuf.indexOf(chip_id_str) < 0){
+        //No reference to our device, so it was uploaded by something else.
+        continue;
+      }
+
+      first_pos = lbuf.indexOf("wd3-")+4;
+      second_pos = lbuf.indexOf(".", first_pos);
+      String filename_id = lbuf.substring(first_pos, second_pos);
+
+      first_pos = lbuf.indexOf("discoveredGps\":")+15;
+      second_pos = lbuf.indexOf(",", first_pos);
+      String discovered_gps = lbuf.substring(first_pos, second_pos);
+
+      first_pos = lbuf.indexOf("totalGps\":")+10;
+      second_pos = lbuf.indexOf(",", first_pos);
+      String total_gps = lbuf.substring(first_pos, second_pos);
+
+      first_pos = lbuf.indexOf("fileSize\":")+10;
+      second_pos = lbuf.indexOf(",", first_pos);
+      String file_size = lbuf.substring(first_pos, second_pos);
+
+      boolean is_waiting = true;
+      if (lbuf.indexOf("wait\":null") > 0){
+        is_waiting = false;
+      }
+
+      if (wigle_history_cursor < wigle_history_len){
+        struct wigle_file wigle_file_reference;
+        wigle_file_reference = (wigle_file){.fid = (int) filename_id.toInt(), .fsize = (int) file_size.toInt(), .discovered_gps = (int) discovered_gps.toInt(), .total_gps = (int) total_gps.toInt(), .wait = is_waiting};
+        wigle_history[wigle_history_cursor] = wigle_file_reference;
+        wigle_history_cursor++;
+      }
+      
+    }
+  }
+  ESP_LOGD(LOG_TAG_GENERIC, "WiGLE connection closed, found %i uploads", wigle_history_cursor);
+}
+
+boolean wigle_upload(String path){
+  clear_display();
+  display.println("WiGLE Upload");
+  display.display();
+  if (!SD.exists(path)){
+    ESP_LOGD(LOG_TAG_GENERIC, "Wigle upload filepath not found: %s", path.c_str());
+    return false;
+  }
+
+  if (!SD.exists("/wigle.crt")){
+    ESP_LOGW(LOG_TAG_GENERIC, "No WiGLE CA cert file!");
+    return false;
+  }
+  
+  //Current root is 1940, double it in case larger certs are used in the future.
+  #define ca_len 3880
+  byte ca_root[ca_len] = {}; // PEM must remain NUL-terminated.
+  ESP_LOGV(LOG_TAG_GENERIC, "Load WiGLE CA");
+  File careader = SD.open("/wigle.crt", FILE_READ);
+  if (careader.size() > ca_len-2){
+    ESP_LOGW(LOG_TAG_GENERIC, "WiGLE CA too large");
+    return false;
+  }
+  careader.read(ca_root, ca_len);
+  careader.close();
+
+  String boundary = "wduk";
+  boundary.concat(esp_random());
+  
+  WiFiClientSecure httpsclient;
+  httpsclient.setCACert((char*)ca_root);
+
+  if (!httpsclient.connect("api.wigle.net", 443)){
+    ESP_LOGW(LOG_TAG_GENERIC, "WiGLE connection failed");
+    return false;
+  }
+  ESP_LOGD(LOG_TAG_GENERIC, "WiGLE connection opened");
+  display.println("Connected");
+  display.display();
+  
+  File filereader = SD.open(path);
+
+  ESP_LOGD(LOG_TAG_GENERIC, "Starting upload to WiGLE");
+
+  String nice_filename = generate_filename(path);
+
+  //This is horrible :^)
+  //Content-Disposition headers appear in the HTTP body, this is the calculated size.
+  int cd_header_len = 0;
+  cd_header_len += (boundary.length()+2)*3; //We use the boundary 3 times, double-dashed (the +2)
+  cd_header_len += 2; //The additional double-dash for the final boundary.
+  cd_header_len += 56; //Initial content-disposition filename line, including closing quote
+  cd_header_len += nice_filename.length();
+  cd_header_len += 22; //Content-Type CSV
+  cd_header_len += 45; //Second content-disposition line for "donate" form.
+  if (wigle_commercial){
+    ESP_LOGV(LOG_TAG_GENERIC, "WiGLE commercial optin selected");
+    cd_header_len += 4; //"on" + \n\r
+  }
+  cd_header_len += 22; //New lines (doubled, because it's CR&LF)
+  ESP_LOGV(LOG_TAG_GENERIC, "WiGLE upload cd_header_len = %i", cd_header_len);
+  
+  httpsclient.println("POST /api/v2/file/upload HTTP/1.0");
+  httpsclient.println("Host: api.wigle.net");
+  httpsclient.println("Connection: close");
+  httpsclient.print("User-Agent: ");
+  httpsclient.println(generate_user_agent());
+  if (wigle_api_key.length() > 2){
+    httpsclient.print("Authorization: Basic ");
+    httpsclient.println(wigle_api_key);
+  }
+  httpsclient.print("Content-Type: multipart/form-data; boundary=");
+  httpsclient.println(boundary);
+  httpsclient.print("Content-Length: ");
+  httpsclient.println(filereader.size()+cd_header_len);
+  
+  boundary = "--" + boundary;
+  //End header:
+  httpsclient.println();
+  //Start content-disposition file header:
+  httpsclient.println(boundary);
+  httpsclient.print("Content-Disposition: form-data; name=\"file\"; filename=\"");
+  httpsclient.print(nice_filename);
+  httpsclient.println("\"");
+  httpsclient.println("Content-Type: text/csv");
+  //End content-disposition file header:
+  httpsclient.println();
+  //Start file body:
+
+  #define CBUFLEN 1024
+  byte cbuf[CBUFLEN];
+  
+  float percent = 0;
+  float filesize = (float)filereader.size();
+  int i = 0;
+  while (filereader.available()){
+    int bytes_read = filereader.read(cbuf, CBUFLEN);
+    if (bytes_read > 0){
+      httpsclient.write(cbuf, bytes_read);
+      ESP_LOGV(LOG_TAG_GENERIC, "Read and sent %i bytes", bytes_read);
+    } else {
+      ESP_LOGW(LOG_TAG_GENERIC, "file read returned %i during WiGLE upload", bytes_read);
+      break;
+    }
+
+    if (i > 40 || i == 0){
+      i = 0;
+      clear_display();
+      display.println("WiGLE Upload");
+      percent = ((float)filereader.position() / filesize) * 100;
+      display.print(percent);
+      display.println("%");
+      display.display();
+    }
+    i++;
+  }
+
+  //httpsclient.write(filereader);
+  //End file body:
+  httpsclient.println();
+  httpsclient.println();
+  //Start content-disposition form header:
+  httpsclient.println(boundary);
+  httpsclient.println("Content-Disposition: form-data; name=\"donate\"");
+  //End content-disposition form header:
+  httpsclient.println();
+  //Start form body:
+  if (wigle_commercial){
+    httpsclient.println("on");
+  }
+  //End content-disposition:
+  httpsclient.print(boundary);
+  httpsclient.println("--");
+  httpsclient.println();
+  httpsclient.flush();
+
+  ESP_LOGD(LOG_TAG_GENERIC, "Upload complete");
+  clear_display();
+  display.println("Transfer complete");
+  display.display();
+
+  String serverres = "";
+
+  while (httpsclient.connected()){
+    if (httpsclient.available()){
+      char c = httpsclient.read();
+      serverres.concat(c);
+    }
+    if (serverres.length() > 1024){
+      ESP_LOGW(LOG_TAG_GENERIC, "Abort WiGLE read; payload too large");
+      break;
+    }
+  }
+  ESP_LOGV(LOG_TAG_GENERIC, "serverres = %s", serverres.c_str());
+
+  httpsclient.stop();
+  ESP_LOGD(LOG_TAG_GENERIC, "WiGLE connection closed");
+
+  if (serverres.indexOf("\"success\":true") > -1){
+    ESP_LOGD(LOG_TAG_GENERIC, "WiGLE upload success confirmed");
+    return true;
+  }
+  ESP_LOGD(LOG_TAG_GENERIC, "WiGLE upload was not confirmed");
+  return false;
+}
+
+String ota_get_url(String url, String write_to=""){
+  if (ota_optout){
+    ESP_LOGD(LOG_TAG_GENERIC, "OTA optout, refusing connection");
+    return "";
+  }
+  clear_display();
+  display.println("Contacting server");
+  display.display();
+
+  ESP_LOGD(LOG_TAG_GENERIC, "OTA GET URL: %s", url.c_str());
+
+  WiFiClientSecure httpsclient;
+  if (use_fallback_cert){
+    ESP_LOGD(LOG_TAG_GENERIC, "Use OTA fallback cert");
+    httpsclient.setCACert(FALLBACK_OTA_CERT);
+  } else {
+    ESP_LOGD(LOG_TAG_GENERIC, "Use OTA main cert");
+    httpsclient.setCACert(PRIMARY_OTA_CERT);
+  }
+  if (!httpsclient.connect(ota_hostname.c_str(), 443)){
+    if (!use_fallback_cert){
+      ESP_LOGD(LOG_TAG_GENERIC, "Failed to open OTA connection, will retry with fallback cert");
+      use_fallback_cert = true;
+      return ota_get_url(url);
+    } else {
+      ESP_LOGW(LOG_TAG_GENERIC, "Failed to open OTA connection, giving up");
+      return "";
+    }
+  } else {
+    httpsclient.print("GET ");
+    httpsclient.print(url);
+    httpsclient.println(" HTTP/1.0");
+    httpsclient.print("Host: ");
+    httpsclient.println(ota_hostname);
+    httpsclient.println("Connection: close");
+    httpsclient.print("User-Agent: ");
+    httpsclient.println(generate_user_agent());
+    httpsclient.println();
+  }
+  String return_out = "";
+  boolean headers_ended = false;
+  unsigned long content_length_long = 0;
+  while (httpsclient.connected()){
+    String buff = httpsclient.readStringUntil('\n');
+    if (!headers_ended){
+      ESP_LOGV(LOG_TAG_GENERIC, "OTA buff = %s", buff.c_str());
+    }
+    if (buff == "\r" || buff == "\n" || buff.length() == 0){
+      headers_ended = true;
+      ESP_LOGV(LOG_TAG_GENERIC, "End of headers");
+      if (write_to == ""){
+        continue;
+      }
+    }
+    if (!headers_ended){
+      int clpos = buff.indexOf("Content-Length: ");
+      if (clpos > -1){
+        String content_length = buff.substring(clpos+16);
+        ESP_LOGV(LOG_TAG_GENERIC, "Got OTA Content-Length of (str)%s", content_length.c_str());
+        content_length_long = content_length.toInt();
+      }
+    }
+    if (headers_ended){
+      if (write_to == ""){
+        return_out.concat(buff);
+        return_out.concat('\n');
+        if (return_out.length() > 1024){
+          return return_out;
+        }
+      } else {
+        SD.remove(write_to);
+        File fw_writer = SD.open(write_to, FILE_WRITE);
+        unsigned long lastbyte = millis();
+        unsigned long bytecounter = 0;
+        byte dbuf[256];
+        int blocks_read = 0;
+        unsigned long total_bytes_read = 0;
+        while (httpsclient.connected() && (millis() - lastbyte) < 10000){
+          if (httpsclient.available()){
+            int bytes_read = httpsclient.read(dbuf, sizeof(dbuf));
+            total_bytes_read += bytes_read;
+            fw_writer.write(dbuf, bytes_read);
+            lastbyte = millis();
+            blocks_read++;
+            if (blocks_read > 250){
+              blocks_read = 0;
+              float percent = ((float)total_bytes_read / (float)content_length_long) * 100;
+              clear_display();
+              display.print("Downloading ");
+              display.println(write_to);
+              display.print(percent);
+              display.println("%");
+              display.display();
+            }
+          }
+        }
+        fw_writer.flush();
+        fw_writer.close();
+      }
+    }
+  }
+  ESP_LOGD(LOG_TAG_GENERIC, "End of OTA communication");
+  return return_out;
+}
+
+boolean check_for_updates(boolean stable=true, boolean download_now=false){
+  String res = ota_get_url("/latest.txt");
+  ESP_LOGV(LOG_TAG_GENERIC, "latest.txt buff = %s", res.c_str());
+  
+  int cur = 0;
+  String partbuf = "";
+  boolean reading_stable = false;
+  int linecount = 0;
+  int partcount = 0;
+  boolean update_available = false;
+  String server_b_hash = "";
+  while (cur <= res.length()){
+    char c = res.charAt(cur);
+    if (c == '>' || c == '\n'){
+      //Handle partbuf.
+      if (partbuf == "SR"){
+        reading_stable = true;
+      }
+      if (partbuf == "PR"){
+        reading_stable = false;
+      }
+
+      if (partcount == 1){
+        if (reading_stable){
+          ota_latest_stable = partbuf;
+        } else {
+          ota_latest_beta = partbuf;
+        }
+      }
+      if (partcount == 4){
+        server_b_hash = partbuf;
+      }
+
+      if (stable == reading_stable){
+        //This is the branch we are interested in
+        if (partcount == 1){
+          //VERSION
+          if (partbuf != VERSION){
+            update_available = true;
+          }
+        }
+        if (update_available){
+          if (partcount == 5){
+            if (download_now){
+              ota_get_url(partbuf, "/A.bin");
+            }
+          }
+          if (partcount == 6){
+            if (download_now){
+              if (server_b_hash != preferences.getString("b_checksum","x")){
+                ota_get_url(partbuf, "/B.bin");
+              } else {
+                ESP_LOGD(LOG_TAG_GENERIC, "Not downloading B, already installed (hash check)");
+              }
+            }
+          }
+        }
+      }
+      
+      partbuf = "";
+      partcount++;
+      if (c == '\n'){
+        linecount++;
+        partcount = 0;
+      }
+    } else {
+      partbuf.concat(c);
+    }
+
+    cur++;
+  }
+  
+  return update_available;
+}
+
+void setup_wifi(){
+  //Gets the WiFi ready for scanning by disconnecting from networks and changing mode.
+  //Turn off entirely to cleanup any references to active networks
+  WiFi.mode(WIFI_OFF);
+  delay(250);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+}
+
+void clear_display(){
+  //Clears the LCD and resets the cursor.
+  display.clearDisplay();
+  display.setCursor(0, 0);
+}
+
+int get_config_int(String key, int def=0){
+  String res = get_config_option(key);
+  if (res == ""){
+    return def;
+  }
+  return res.toInt();
+}
+
+float get_config_float(String key, int def=0){
+  String res = get_config_option(key);
+  if (res == ""){
+    return def;
+  }
+  return res.toFloat();
+}
+
+String file_hash(String filename, boolean update_lcd=false, String lcd_prompt="Wardriver busy"){
+  //Updating the LCD is VERY slow compared to the hashing logic. Don't set update_lcd unless the file is huge.
+  //LCD will update every 120KB of data read, so it's basically useless on files under ~240KB
+
+  File reader = SD.open(filename, FILE_READ);
+  //Setup a hash context, and somewhere to keep the output.
+  unsigned char genhash[32];
+  static byte bbuf[4096];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+
+  int i = 0;
+
+  while (reader.available()){
+    int bytes_read = reader.read(bbuf, sizeof(bbuf));
+    if (bytes_read > 0){
+      //if it's <=0, then we read everything and the loop should break.
+      //We'll let .available() handle the loop break however.
+      mbedtls_sha256_update(&ctx, bbuf, bytes_read);
+    }
+    if (update_lcd){
+      i++;
+      if (i > 30 || i == 0){
+        i = 1;
+        clear_display();
+        display.println(lcd_prompt);
+        float percent = ((float)reader.position() / (float)reader.size()) * 100;
+        display.print(percent);
+        display.println("%");
+        display.display();
+      }
+    }
+  }
+  mbedtls_sha256_finish(&ctx, genhash);
+  reader.close();
+  return hex_str(genhash, sizeof genhash);
+}
+
+String html_escape(String ret){
+  ret.replace("<","&lt;");
+  ret.replace(">","&gt;");
+  ret.replace("&","&amp;");
+  ret.replace("\"","&quot;");
+  ret.replace("'","&#39;");
+  return ret;
+}
+
+String online_hash_check(String check_hash){
+  //Return "" for invalid hashes, or a human-readable message about the release.
+  String url = "/hashes/";
+  url.concat(check_hash);
+  url.concat(".txt");
+  
+  String result = ota_get_url(url);
+  ESP_LOGI(LOG_TAG_GENERIC, "Got OTA hash check response: %s", result.c_str());
+  
+  if (result == ""){
+    return "";
+  }
+  String checkfor = "OKHASH>";
+  checkfor.concat(check_hash);
+  if (result.indexOf(checkfor) > -1){
+    int version_pos = result.indexOf("VERS>")+5;
+    int date_pos = result.indexOf("DATE>")+5;
+    String retmsg = "Valid official release ";
+    if (version_pos > -1 && date_pos > -1){
+      int version_end_pos = result.indexOf("\n",version_pos);
+      int date_end_pos = result.indexOf("\n",date_pos);
+      String release_version = result.substring(version_pos, version_end_pos);
+      String release_datetime = result.substring(date_pos, date_end_pos);
+      release_version = html_escape(release_version);
+      release_datetime = html_escape(release_datetime);
+      retmsg.concat(release_version);
+      retmsg.concat(" from ");
+      retmsg.concat(release_datetime);
+      retmsg.concat(". ");
+      if (release_version != ota_latest_stable && release_version != ota_latest_beta){
+        retmsg.concat("<a href=\"/repupdate\">Newer version available</a>");
+      }
+    }
+    return retmsg;
+  } else {
+    return "";
+  }
+
+
+  return "";
+}
+
+boolean install_firmware(String filepath, String expect_hash = "") {
+  //Install a .bin binary to the local device.
+  //If expect_hash is not empty, the hash will be validated first.
+  
+  if (!SD.exists(filepath)) {
+    ESP_LOGE(LOG_TAG_GENERIC, "Requested install of a non-existing local binary file: ", filepath.c_str());
+    return false;
+  }
+
+  ESP_LOGD(LOG_TAG_GENERIC, "Validating firmware");
+  String actual_hash = file_hash(filepath, true, "Validating firmware");
+  if (expect_hash.length() > 0) {
+    if (expect_hash != actual_hash) {
+      ESP_LOGE(LOG_TAG_GENERIC, "Validation failed, expecting %s but got %s", expect_hash.c_str(), actual_hash.c_str());
+      return false;
+    }
+  }
+
+  if (enforce_valid_binary_checksums) {
+    //At this point, make a HTTPS request to an API which can validate the .bin checksum.
+    //Fail here if the checksum is a mismatch.
+    ESP_LOGD(LOG_TAG_GENERIC, "Start OTA online hash check for value %s", actual_hash.c_str());
+    
+    String check_result = online_hash_check(actual_hash);
+    if (check_result == ""){
+      ESP_LOGE(LOG_TAG_GENERIC, "Got no OTA result for hash %s, aborting.", actual_hash.c_str());
+      return false;
+    }
+    
+  }
+
+  if (filepath == "/A.bin"){
+
+    clear_display();
+    display.println("Installing update");
+    display.display();
+  
+    File binreader = SD.open(filepath, FILE_READ);
+    #define binbuflen 4096
+    uint8_t binbuf[binbuflen] = { 0x00 };
+  
+    Update.begin(binreader.size());
+    int i = 0;
+
+    ESP_LOGD(LOG_TAG_GENERIC, "Installing update (%i bytes)", binreader.size());
+    
+    while (binreader.available()) {
+      int bytes_read = binreader.read(binbuf, binbuflen);
+      if (bytes_read > 0){
+        Update.write(binbuf, bytes_read);
+        i++;
+      }
+      if (i == 80){
+        i = 0;
+        clear_display();
+        display.print("Installing: ");
+        float percent = ((float)binreader.position() / (float)binreader.size()) * 100;
+        display.print(percent);
+        display.println("%");
+        display.println("DO NOT POWER OFF");
+        display.display();
+        ESP_LOGV(LOG_TAG_GENERIC, "Installation at %f%%", percent);
+      }
+      
+    }
+    
+    Update.end(true);
+    ESP_LOGI(LOG_TAG_GENERIC, "Installation complete, will restart");
+
+    binreader.close();
+  
+    clear_display();
+    display.println("Update installed");
+    display.println("Restarting now");
+    display.display();
+    delay(1000);
+    SD.remove("/A.bin");
+    ESP.restart();
+  
+    return true;
+  }
+
+  if (filepath == "/B.bin"){
+    ESP_LOGD(LOG_TAG_GENERIC, "Request installation of side B firmware");
+    boolean update_ready = false;
+    Serial1.flush();
+    String b_buff = "";
+    int ready_failures = 0;
+    clear_display();
+    display.println("Getting B ready");
+    display.display();
+    
+    while (!update_ready){
+      ESP_LOGD(LOG_TAG_GENERIC, "Getting side B ready");
+      Serial1.print("FWUP:");
+      Serial1.print(actual_hash);
+      Serial1.print("\n");
+      Serial1.flush();
+      int linecounter = 0;
+      while (linecounter < 5){
+        String buff = Serial1.readStringUntil('\n');
+        if (buff.indexOf(actual_hash) > -1){
+          update_ready = true;
+          break;
+        }
+        
+        ESP_LOGV(LOG_TAG_GENERIC, "Unwanted or unexpected side B response: %s", buff.c_str());
+        buff = "";
+        linecounter++;
+        clear_display();
+        display.println("Getting B ready");
+        display.print("Attempt: ");
+        display.println(ready_failures);
+        display.display();
+      }
+      if (!update_ready){
+        ready_failures++;
+      }
+      if (ready_failures > 99){
+        ESP_LOGE(LOG_TAG_GENERIC, "Failed to get side B ready. Likely outdated and does not support OTA; please update manually");
+        clear_display();
+        display.println("FAILURE");
+        display.println("Update B manually!");
+        display.println("OTA not supported");
+        display.display();
+        delay(10000);
+        return false;
+      }
+    }
+    //At this point, B side is in update mode.
+    ESP_LOGD(LOG_TAG_GENERIC, "Side B ready");
+
+    while (Serial1.available()){
+      //Ensure the buffer is empty
+      Serial1.read();
+    }
+    
+    //0xE9 is the binary header, let's spam something else to be sure we're clear of junk
+    for(int i=0; i<2100; i++){
+      Serial1.write(0xFF);
+      Serial1.flush();
+      if (i % 100 == 0 || i < 2){
+        clear_display();
+        display.println("B is ready");
+        display.println("Please wait");
+        display.print(i);
+        display.print(" / ");
+        display.println("2100");
+        display.display();
+      }
+      delay(1);
+    }
+    //B will sense 0xFF -> 0xE9 and start the update.
+
+    //START UPDATE
+
+    File binreader = SD.open(filepath, FILE_READ);
+    int counter = 0;
+    int pause_byte_counter = 0;
+
+    #define bbuf_maxlen 1024
+    int bbuf_len = bbuf_maxlen;
+
+    // If we're on the slower baud, assume that Side B is out of date.
+    // Make a few changes to ensure backwards-compatibility.
+    if (pcb_baud_rate == PCB_BAUD_RATE_DEFAULT){
+      bbuf_len = 110;
+    }
+    static byte bbuf[bbuf_maxlen];
+    
+    while (binreader.available()) {
+      int bytes_read = binreader.read(bbuf, bbuf_len);
+      //Read the next block into the buffer, then send it as soon as B requests it.
+
+      while (!Serial1.available()){
+          //This prevents sending more data until we receive anything from side B
+          //Put the display logic here so the device has something to do while waiting
+          if (counter > 50 || counter == 0){
+            counter = 1;
+            clear_display();
+            display.print("Installing: ");
+            float percent = ((float)binreader.position() / (float)binreader.size()) * 100;
+            display.print(percent);
+            display.println("%");
+            display.println("DO NOT POWER OFF");
+            display.display();
+            ESP_LOGV(LOG_TAG_GENERIC, "Installation at %f%%", percent);
+          } else {
+            delay(1);
+          }
+      }
+      Serial1.read(); //Should be one byte only, clear it.
+
+      if (bytes_read > 0){
+        Serial1.write(bbuf, bytes_read);
+        Serial1.flush();
+        ESP_LOGV(LOG_TAG_GENERIC, "Sent %ib", bytes_read);
+        counter++;
+      }
+      if (pcb_baud_rate == PCB_BAUD_RATE_DEFAULT){
+        delay(1);
+        while(Serial1.available()){
+          Serial1.read();
+        }
+      }
+    }
+    Serial1.flush();
+    
+    clear_display();
+    display.println("Completing install");
+    display.println("Please wait");
+    display.println("DO NOT POWER OFF");
+    display.display();
+    int tocounter = 0;
+    boolean did_update = false;
+    boolean transfer_success = false;
+
+    while (!did_update){
+      String buff = Serial1.readStringUntil('\n');
+      clear_display();
+      if (!transfer_success){
+        display.println("Verifying..");
+      } else {
+        display.println("Finalizing..");
+      }
+      display.println("DO NOT POWER OFF");
+      display.print("Count:");
+      tocounter++;
+      display.println(tocounter);
+      display.display();
+      if (buff.indexOf(actual_hash) > -1){
+        ESP_LOGI(LOG_TAG_GENERIC, "Side B installation completed and verified");
+        transfer_success = true;
+        tocounter = 0;
+      }
+      if (buff.indexOf("FAILURE") > -1){
+        ESP_LOGE(LOG_TAG_GENERIC, "Side B reported installation failure: hash mismatch");
+        clear_display();
+        display.println("FAILURE");
+        display.println("Hash mismatch");
+        display.display();
+        delay(10000);
+        return false;
+      }
+      if (transfer_success == true && tocounter > 3){
+        ESP_LOGI(LOG_TAG_GENERIC, "Update complete");
+        clear_display();
+        display.println("Update complete");
+        display.display();
+        delay(4000);
+        did_update = true;
+        SD.remove("/B.bin");
+        return true;
+      }
+      if (transfer_success == false && tocounter > 40){
+        ESP_LOGE(LOG_TAG_GENERIC, "Update failed");
+        clear_display();
+        display.println("!FAILURE!");
+        display.println("Try again");
+        display.display();
+        delay(7500);
+        return false;
+      }
+      
+    }
+    binreader.close();
+  }
+
+  return true;
+}
+
+String hex_str(const unsigned char buf[], size_t len)
+{
+    String outstr;
+    char outchr[6];
+    for (size_t i = 0; i < len; i++) {
+        if (buf[i] <= 0xF) {
+            sprintf(outchr, "0%x", buf[i]);
+        } else {
+            sprintf(outchr, "%x", buf[i]);
+        }
+        outstr = outstr + outchr;
+    }
+    return outstr;
+}
+
+boolean get_config_bool(String key, boolean def=false){
+  String res = get_config_option(key);
+  if (res == "true" || res == "yes"){
+    return true;
+  }
+  if (res == "false" || res == "no"){
+    return false;
+  }
+  return def;
+}
+
+String get_config_string(String key, String def=""){
+  String res = get_config_option(key);
+  if (res == ""){
+    return def;
+  }
+  return res;
+}
+
+void wigle_upload_all(){
+  //Automatically upload all new capture files since the feature was enabled to WiGLE.
+  long min_fileid = preferences.getLong("wigle_mf",0);
+  boolean did_upload = false;
+  if (min_fileid == 0){
+    ESP_LOGW(LOG_TAG_GENERIC, "WiGLE autoupload min fileid is 0, refusing to upload! Setting to %u", bootcount);
+    preferences.putLong("wigle_mf",bootcount);
+    return;
+  }
+  ESP_LOGD(LOG_TAG_GENERIC, "WiGLE autoupload running");
+  File dir = SD.open("/");
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) {
+      break;
+    }
+    if (!entry.isDirectory()) {
+      String filename = entry.name();
+      if (filename.charAt(0) != '/'){
+        filename = "/";
+        filename.concat(entry.name());
+      }
+      if (!filename.endsWith(".csv")){
+        ESP_LOGV(LOG_TAG_GENERIC, "%s is not CSV", filename.c_str());
+        continue;
+      }
+
+      //Get the bootcount (numerical) part of a filename, for WiGLE references later.
+      String filename_id = "";
+      int first_pos = filename.indexOf("wd3-")+4;
+      int second_pos = filename.indexOf(".", first_pos);
+      filename_id = filename.substring(first_pos, second_pos);
+      unsigned int filename_id_int = (int) filename_id.toInt();
+      if (filename_id_int < min_fileid){
+        ESP_LOGD(LOG_TAG_GENERIC, "Skip ID %u, less than min_fileid of %u, for file ", filename_id_int, min_fileid, filename.c_str());
+        continue;
+      } else {
+        ESP_LOGD(LOG_TAG_GENERIC, "File ID %u is OK, min is %u", filename_id_int, min_fileid);
+      }
+
+      struct wigle_file wigle_file_reference = get_wigle_file(filename_id_int, entry.size());
+      
+      ESP_LOGV(LOG_TAG_GENERIC, "%s is %i bytes", filename.c_str(), entry.size());
+
+      if (wigle_file_reference.fid == 0){
+        ESP_LOGD(LOG_TAG_GENERIC, "Not on WiGLE, will upload %s", filename.c_str());
+        if (wigle_upload(filename)){
+          ESP_LOGV(LOG_TAG_GENERIC, "Set wigle_minfile to %u", filename_id_int);
+          preferences.putLong("wigle_mf", filename_id_int);
+          delay(2000);
+          did_upload = true;
+        } else {
+          ESP_LOGE(LOG_TAG_GENERIC, "WiGLE autoupload failed, won't attempt any more");
+          return;
+        }
+        
+      }
+    }
+  }
+  ESP_LOGI(LOG_TAG_GENERIC, "Finished WiGLE autoupload");
+  if (did_upload){
+    ESP_LOGD(LOG_TAG_GENERIC, "Some files were autouploaded, will refresh local list");
+    wigle_load_history();
+  } else {
+    ESP_LOGI(LOG_TAG_GENERIC, "Found no files to autoupload");
+  }
+}
+
+void boot_config(){
+  //Load configuration variables and perform first time setup if required.
+  ESP_LOGV(LOG_TAG_GENERIC, "running boot_config()");
+
+  if (DEVICE_TYPE == DEVICE_CSF_MINI){
+    // CoD_Segfault Mini Wardriver Rev2 always has a BW16
+    ESP_LOGV(LOG_TAG_GENERIC, "Detected CSF_MINI, sb_bw16 set to true");
+    sb_bw16 = true;
+  }
+
+  gps_baud_rate = get_config_int("gps_baud_rate", gps_baud_rate);
+  rotate_display = get_config_bool("rotate_display", rotate_display);
+  block_resets = get_config_bool("block_resets", block_resets);
+  block_reconfigure = get_config_bool("block_reconfigure", block_reconfigure);
+  web_timeout = get_config_int("web_timeout", web_timeout);
+  gps_allow_stale_time = get_config_int("gps_allow_stale_time", gps_allow_stale_time);
+  enforce_valid_binary_checksums = get_config_bool("enforce_checksums", enforce_valid_binary_checksums);
+  nets_over_uart = get_config_bool("nets_over_uart", nets_over_uart);
+  ota_hostname = get_config_string("ota_hostname", ota_hostname);
+  auto_reset_ms = get_config_int("auto_reset_ms", auto_reset_ms);
+  force_lat = get_config_float("force_lat", force_lat);
+  force_lon = get_config_float("force_lon", force_lon);
+  sb_bw16 = get_config_bool("sb_bw16", sb_bw16);
+// BlueTooth scan preference
+  scanble = get_config_bool("scanble", scanble);
+  tempunits_c = get_config_bool("tempunits_c", tempunits_c); // temperature in C or F
+  con_ssid_update = get_config_bool("con_ssid_update", con_ssid_update); // update stored WiFi info?
+  pcb_baud_rate_high = get_config_int("pcb_baud_rate_high", pcb_baud_rate_high);
+  
+  if (pcb_baud_rate_high < PCB_BAUD_RATE_DEFAULT){
+    pcb_baud_rate_high = PCB_BAUD_RATE_DEFAULT;
+  }
+  if (pcb_baud_rate_high > MAX_PCB_BAUD_RATE_HIGH){
+    pcb_baud_rate_high = MAX_PCB_BAUD_RATE_HIGH;
+  }
+
+  if (auto_reset_ms != 0){
+    if (auto_reset_ms > MAX_AUTO_RESET_MS){
+      auto_reset_ms = MAX_AUTO_RESET_MS;
+    }
+    if (auto_reset_ms < MIN_AUTO_RESET_MS){
+      auto_reset_ms = MIN_AUTO_RESET_MS;
+    }
+  }
+  
+  if (sb_bw16){
+    is_5ghz = true;
+  }
+
+  if (!rotate_display){
+    display.setRotation(2);
+  } else {
+    display.setRotation(0);
+  }
+
+  preferences.begin("wardriver", false);
+  ota_optout = true; // Fork: do not replace this build with upstream OTA firmware.
+  b_side_hash_full = preferences.getString("b_checksum","xxxxx");
+  wigle_commercial = preferences.getBool("wigle_com", false);
+  wigle_autoupload = preferences.getBool("wigle_au", false);
+  wigle_api_key = preferences.getString("wigle_api_key", "");
+  wigle_api_key.trim(); // Normalize previously saved credentials too.
+  bool firstrun = preferences.getBool("first", true);
+  if (block_reconfigure){
+    firstrun = false;
+  }
+  bool doreset = preferences.getBool("reset", false);
+  if (block_resets){
+    doreset = false;
+  }
+  bootcount = preferences.getULong("bootcount", 0);
+  
+  ESP_LOGD(LOG_TAG_GENERIC, "Loaded device variables");
+
+  DEVICE_TYPE = preferences.getShort("model", DEVICE_UNKNOWN);
+  DEVICE_TYPE = identify_model();
+  preferences.putShort("model", DEVICE_TYPE);
+  
+  if (doreset){
+    ESP_LOGW(LOG_TAG_GENERIC, "Performing device factory reset now!");
+    clear_display();
+    display.println("RESET");
+    display.display();
+    preferences.clear();
+    preferences.end();
+    ESP_LOGV(LOG_TAG_GENERIC, "Will erase nvs");
+    nvs_flash_erase();
+    delay(500);
+    ESP_LOGV(LOG_TAG_GENERIC, "Will init nvs");
+    nvs_flash_init();
+    delay(1000);
+    ESP_LOGW(LOG_TAG_GENERIC, "Rebooting now!");
+    ESP.restart();
+  }
+
+  if (!firstrun && !block_resets){
+    preferences.putBool("reset", true);
+    preferences.end();
+    clear_display();
+    display.println("Power cycle now");
+    display.println("to factory reset");
+    display.display();
+    delay(1250);
+    preferences.begin("wardriver", false);
+    preferences.putBool("reset", false);
+    clear_display();
+  }
+
+  if (firstrun){
+    // Always set the reset flag on unitilized wardrivers so they will have a full NVS reset on each reboot.
+    // This fixes an issue where NVS could be corrupt preventing a wardriver from being setup without a full flash erase.
+    preferences.putBool("reset", true);
+    preferences.end();
+    delay(100);
+    preferences.begin("wardriver", false);
+
+    setup_wifi();
+    ESP_LOGI(LOG_TAG_GENERIC, "Performing first time setup");
+    
+    int n = WiFi.scanNetworks(false,false,false,150);
+
+    ESP_LOGD(LOG_TAG_GENERIC, "Scan complete, result %i", n);
+    ESP_LOGI(LOG_TAG_GENERIC, "Connect to: %s with password %s", default_ssid.c_str(), default_psk);
+
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(default_ssid.c_str(), default_psk);
+    IPAddress IP = WiFi.softAPIP();
+    clear_display();
+    display.println("Connect to:");
+    display.println(default_ssid);
+    display.println(IP);
+    display.display();
+    delay(500);
+    WiFiServer server(80);
+    server.begin();
+    boolean newline = false;
+    String buff;
+
+    while (firstrun){
+      WiFiClient client = server.available();
+      if (client){
+        ESP_LOGD(LOG_TAG_GENERIC, "Client connected");
+        clear_display();
+        display.println("Client connected");
+        display.display();
+      }
+      
+      while (client.connected()){
+        if (client.available()){
+          char c = client.read();
+          
+          buff += c;
+          if (c == '\n'){
+            if (newline){
+              ESP_LOGV(LOG_TAG_GENERIC, "Client buf = %s", buff.c_str());
+
+              client.println("HTTP/1.1 200 OK");
+              client.println("Content-type: text/html");
+              client.println("Connection: close");
+              client.println();
+
+              if (buff.indexOf("GET / HTTP") > -1) {
+                ESP_LOGD(LOG_TAG_GENERIC, "Send FTS page");
+
+                client.print("<style>html{font-size:21px;text-align:center;padding:20px}input[type=text],input[type=password],input[type=submit],select{padding:5px;width:100%;max-width:1000px}form{padding-top:10px}br{display:block;margin:5px 0}</style>");
+                client.print("<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"><h1>wardriver.uk " + device_type_string() + " by Joseph Hewitt</h1><h2>First time setup</h2>");
+                client.print("<p>Please provide the credentials of your WiFi network to get started.</p>");
+                client.print("<p>You can use this network to get your captured data, sync the date/time, and to download updates</p><br>");
+                if (n > 0){
+                  client.println("<script>function ssid_selected(obj){");
+                  client.println("document.getElementById(\"ssid\").value = obj.value;");
+                  client.println("}</script>");
+                  client.println("<select onchange=\"ssid_selected(this)\" name=\"ssid\" id=\"ssid_select\">");
+                  client.println("<option value=\"Select your network\">Select your network</option>");
+                  for (int i = 0; i < n; i++) {
+                    client.print("<option value=\"");
+                    client.print(WiFi.SSID(i));
+                    client.print("\">");
+                    client.print(WiFi.SSID(i));
+                    client.println("</option>");
+                  }
+                  client.println("</select>");
+                }
+                client.print("<form method=\"get\" action=\"/wifi\">WiFi Name (SSID):<input type=\"text\" name=\"ssid\" id=\"ssid\"><br>WiFi Password (PSK):<input type=\"password\" name=\"psk\" id=\"psk\"><br><br><input type=\"submit\" value=\"Submit\"><p><label for=\"otaoptout\"><input type=\"checkbox\" id=\"otaoptout\" name=\"otaoptout\" value=\"otaoptout\"> Disable OTA updates*</label></p></form>");
+                client.print("<a href=\"/wifi?ssid=&psk=\">Continue without network</a>");
+                client.print("<br><hr>Additional help is available at https://wardriver.uk<br>v");
+                client.print(VERSION);
+                if (!BUILD.startsWith("[")){
+                  client.print(" / ");
+                  client.print(BUILD);
+                }
+                client.print("<br><p>*Please see https://wardriver.uk/ota for more information about the OTA update function. Disabling it is not recommended.</p>");
+              }
+
+              if (buff.indexOf("GET /wifi?") > -1){
+                ESP_LOGD(LOG_TAG_GENERIC, "Got WiFi config");
+                if (buff.indexOf("&otaoptout=otaoptout") > -1){
+                  ota_optout = true;
+                  //This only makes me want to switch to POST even more.
+                  buff.replace("&otaoptout=otaoptout","");
+                  preferences.putBool("ota_optout", true);
+                  
+                  ESP_LOGV(LOG_TAG_GENERIC, "OTA opt out selected");
+                }
+                int startpos = buff.indexOf("?ssid=")+6;
+                int endpos = buff.indexOf("&");
+                String new_ssid = GP_urldecode(buff.substring(startpos,endpos));
+                startpos = buff.indexOf("&psk=")+5;
+                endpos = buff.indexOf(" HTTP");
+                String new_psk = GP_urldecode(buff.substring(startpos,endpos));
+
+                preferences.putString("ssid", new_ssid);
+                preferences.putString("psk", new_psk);
+
+                ESP_LOGV(LOG_TAG_GENERIC, "New SSID and PSK: %s + %s", new_ssid.c_str(), new_psk.c_str());
+
+                client.print("<h1>Thanks!</h1>Please wait. <meta http-equiv=\"refresh\" content=\"1; URL=/step2\" />");
+                
+              }
+
+              if (buff.indexOf("GET /step2 HTTP") > -1){
+                ESP_LOGD(LOG_TAG_GENERIC, "Starting step2");
+                client.print("<style>html{font-size:21px;text-align:center;padding:20px}input,select{padding:5px;width:100%;max-width:1000px}form{padding-top:10px}br{display:block;margin:5px 0}</style>");
+                client.print("<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"><h1>wardriver.uk " + device_type_string() + " by Joseph Hewitt</h1><h2>Fallback network setup</h2>");
+                client.print("If your wardriver is unable to connect to your main network it will create a network which your device can join. Please provide some credentials for this fallback network.<br>");
+                client.print("<form method=\"get\" action=\"/fbwifi\">SSID:<input type=\"text\" name=\"ssid\" id=\"ssid\"><br>PSK:<input type=\"password\" name=\"psk\" id=\"psk\"><br><input type=\"submit\" value=\"Submit\"></form>");
+                client.print("<a href=\"/fbwifi?ssid=&psk=\">Continue without fallback network</a>");
+                client.print("<br><hr>Additional help is available at http://wardriver.uk<br>v");
+                client.print(VERSION);
+              }
+
+              if (buff.indexOf("GET /fbwifi?") > -1){
+                ESP_LOGV(LOG_TAG_GENERIC, "Got Wifi fallback config");
+                int startpos = buff.indexOf("?ssid=")+6;
+                int endpos = buff.indexOf("&");
+                String new_ssid = GP_urldecode(buff.substring(startpos,endpos));
+                startpos = buff.indexOf("&psk=")+5;
+                endpos = buff.indexOf(" HTTP");
+                String new_psk = GP_urldecode(buff.substring(startpos,endpos));
+
+                preferences.putString("fbssid", new_ssid);
+                preferences.putString("fbpsk", new_psk);
+
+                ESP_LOGV(LOG_TAG_GENERIC, "New SSID and PSK: %s + %s", new_ssid.c_str(), new_psk.c_str());
+                client.print("<h1>Thanks!</h1>Your wardriver is now getting ready. <meta http-equiv=\"refresh\" content=\"1; URL=/done\" />");
+              }
+
+              if (buff.indexOf("GET /done HTTP") > -1){
+                ESP_LOGV(LOG_TAG_GENERIC, "Setup complete");
+                client.print("<h1>Setup complete!</h1>Your wardriver will now boot normally.");
+                client.print("\n\r\n\r");
+                client.flush();
+                delay(800);
+                client.stop();
+                preferences.putBool("first", false);
+                firstrun = false;
+                break;
+              }
+
+              client.print("\n\r\n\r");
+              client.flush();
+              delay(5);
+              client.stop();
+              buff = "";
+            }
+            newline = true;
+          } else {
+            if (c != '\r'){
+              newline = false;
+            }
+          }
+          
+        }
+        
+      }//client
+    } //firstrun
+
+    // During firstrun: "reset" always forced to true. Set it back to false now we're done.
+    preferences.putBool("reset", false);
+    preferences.end();
+    delay(100);
+    preferences.begin("wardriver", false);
+    
+  }
+  setup_wifi();
+
+  bootcount++;
+  preferences.putULong("bootcount", bootcount);
+
+  String con_ssid = preferences.getString("ssid","");
+  String con_psk = preferences.getString("psk","");
+  con_ssid = get_config_string("con_ssid", con_ssid);
+  con_psk = get_config_string("con_psk", con_psk);
+  String fb_ssid = preferences.getString("fbssid","");
+  String fb_psk = preferences.getString("fbpsk","");
+  fb_ssid = get_config_string("fb_ssid", fb_ssid);
+  fb_psk = get_config_string("fb_psk", fb_psk);
+  boolean created_network = false; //Set to true automatically when the fallback network is created.
+
+  // update the WiFi connection information into preferences if requested
+  if (con_ssid_update) {
+    preferences.putString("ssid",con_ssid);
+    preferences.putString("psk",con_psk);
+    ESP_LOGV(LOG_TAG_GENERIC, "con_ssid_update to %s + %s", con_ssid.c_str(), con_psk.c_str());
+  }
+
+  boolean is_stable = true; //Currently running beta or stable, set automatically
+  //Maybe set this to check for any letters, since normal stable version numbers probably don't have any letters.
+  //This should catch rc versions and beta versions though.
+  if (VERSION.indexOf("b") > -1){
+    is_stable = false;
+  }
+  if (VERSION.indexOf("r") > -1){
+    is_stable = false;
+  }
+
+  if (con_ssid != "" || fb_ssid != ""){
+    ESP_LOGD(LOG_TAG_GENERIC, "Attempting to connect to WiFi");
+    clear_display();
+    display.print("Connecting to:");
+    display.print(con_ssid);   // show the WiFi network name
+    display.display();
+    if (con_ssid != ""){
+      WiFi.begin(con_ssid, con_psk);
+      
+      int fcount = 0;
+      while (WiFi.status() != WL_CONNECTED) {
+        display.print(".");
+        display.display();
+        delay(150);
+        fcount++;
+        if (fcount > 75){
+          clear_display();
+          display.println("WiFi connect failed");
+          display.display();
+          delay(500);
+          if (fb_ssid != ""){
+            WiFi.mode(WIFI_AP);
+            WiFi.softAP(fb_ssid.c_str(), fb_psk.c_str());
+            created_network = true;
+            delay(500);
+          }
+          break;
+        }
+      }
+    } else {
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP(fb_ssid.c_str(), fb_psk.c_str());
+      created_network = true;
+      delay(500);
+    }
+
+    boolean update_available = false;
+    if (WiFi.status() == WL_CONNECTED || created_network == true){
+      IPAddress fb_IP = WiFi.softAPIP();
+      clear_display();
+      if (!created_network){
+        display.println("Attempting NTP sync");
+        display.display();
+        ESP_LOGD(LOG_TAG_GENERIC, "Network connected, attempting NTP");
+        configTime(0, 0, ntpServer);
+
+        ESP_LOGI(LOG_TAG_GENERIC, "The time is now %u", get_epoch(true));
+        String ota_test = ota_get_url("/");
+        ESP_LOGV(LOG_TAG_GENERIC, "OTA test, page root = %s", ota_test.c_str());
+
+        //Implement a hash check, only run if there's a mismatch.
+        ESP_LOGD(LOG_TAG_GENERIC, "Will download wigle.crt");
+        SD.remove("/wigle.crt");
+        ota_get_url("/wigle.crt", "/wigle.crt");
+
+        wigle_load_history();
+        if (wigle_autoupload){
+          wigle_upload_all();
+        } else {
+          ESP_LOGV(LOG_TAG_GENERIC, "Not performing WiGLE autoupload - it is disabled");
+        }
+
+        update_available = check_for_updates(is_stable, false);
+      }
+      unsigned long disconnectat = millis() + web_timeout;
+      String buff;
+      boolean newline = false;
+      WiFiServer server(80);
+      server.begin();
+      while (WiFi.status() == WL_CONNECTED || created_network == true){
+        clear_display();
+        if (created_network){
+          display.print("SSID:");
+          display.println(fb_ssid);
+          display.println(fb_IP);
+        } else {
+          display.println(device_type_string());
+          display.println(WiFi.localIP());
+        }
+        display.print((disconnectat - millis())/1000);
+        display.println("s until boot");
+        if (update_available){
+          display.println("Update available");
+        }
+        display.display();
+        
+        if (millis() > disconnectat){
+          ESP_LOGD(LOG_TAG_GENERIC, "Disconnecting from WiFi");
+          clear_display();
+          display.println("Disconnecting");
+          display.display();
+          setup_wifi();
+          delay(250);
+          break;
+        }
+        WiFiClient client = server.available();
+        if (client){
+          unsigned long client_last_byte_at = millis();
+          ESP_LOGV(LOG_TAG_GENERIC, "New client connection");
+          clear_display();
+          display.println("Client connected");
+          display.println("Awaiting request..");
+          display.display();
+          boolean first_byte = true;
+          while (client.connected()){
+            if (millis() - client_last_byte_at > HTTP_TIMEOUT_MS){
+              ESP_LOGW(LOG_TAG_GENERIC, "Hit the HTTP client last_byte timeout, breaking the connection");
+              client.stop();
+            }
+            if (client.available()){
+              client_last_byte_at = millis();
+              if (first_byte){
+                first_byte = false;
+                ESP_LOGV(LOG_TAG_GENERIC, "Got the first byte of the request");
+                display.println("Handling request..");
+                display.display();
+              }
+              char c = client.read();
+              
+              buff += c;
+              if (c == '\n'){
+                if (newline){
+                  ESP_LOGV(LOG_TAG_GENERIC, "End of client request: %s", buff.c_str());
+                  client.println("HTTP/1.1 200 OK");
+                  client.println("Connection: close");
+                  
+                  disconnectat = millis() + web_timeout;
+    
+                  if (buff.indexOf("GET / HTTP") > -1) {
+                    client.println("Content-type: text/html");
+                    client.println();
+                    ESP_LOGV(LOG_TAG_GENERIC, "Sending homepage");
+                    client.println("<style>html,td,th{font-size:21px;text-align:center;padding:20px }table{padding:5px;width:100%;max-width:1000px;}td, th{border: 1px solid #999;padding: 0.5rem;}</style>");
+                    client.println("<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"><h1>wardriver.uk " + device_type_string() + " by Joseph Hewitt</h1></head>");
+                    if (update_available && !SD.exists("/A.bin") && !SD.exists("/B.bin")){
+                      client.println("<p><a href=\"/dlupdate\">Software update available. Click here to download.</a></p>");
+                    } else {
+                      if (created_network){
+                        client.println("<p>This device can check for updates automatically if connected to the internet.</p>");
+                      }
+                    }
+                    //We really need to stop hardcoding these :)
+                    if (SD.exists("/A.bin") || SD.exists("/B.bin")){
+                      client.println("<p>A software update is ready. <a href=\"/fwup\">click here to view</a></p>");
+                    }
+                    if (ota_optout){
+                      client.println("<p>OTA updates are turned off: <a href=\"/ota_change_pref\">Opt-in</a></p>");
+                    }
+
+                    client.print("<p><a href=\"/wigle-setup\">WiGLE Settings</a>");
+                    if (wigle_username.length() > 1){
+                      client.print(" (logged in as ");
+                      client.print(html_escape(wigle_username));
+                      client.print(")");
+                    } else if (wigle_api_key.length() > 2){
+                      client.print(" (login failed)");
+                    } else {
+                      client.print(" (not configured)");
+                    }
+
+                    client.println("</p>");
+                    
+                    client.println("<table><tr><th>File</th><th>Size</th><th>Status</th><th>Opt</th></tr>");
+                    ESP_LOGD(LOG_TAG_GENERIC, "Scanning for files");
+                    File dir = SD.open("/");
+                    while (true) {
+                      File entry = dir.openNextFile();
+                      if (!entry) {
+                        break;
+                      }
+                      if (!entry.isDirectory()) {
+                        String filename = entry.name();
+                        if (filename.charAt(0) != '/'){
+                          filename = "/";
+                          filename.concat(entry.name());
+                        }
+
+                        //Get the bootcount (numerical) part of a filename, for WiGLE references later.
+                        String filename_id = "";
+                        int first_pos = filename.indexOf("wd3-")+4;
+                        int second_pos = filename.indexOf(".", first_pos);
+                        filename_id = filename.substring(first_pos, second_pos);
+                        unsigned int filename_id_int = (int) filename_id.toInt();
+
+                        struct wigle_file wigle_file_reference = get_wigle_file(filename_id_int, entry.size());
+                        
+                        client.print("<tr><td>");
+                        client.print("<a href=\"/download?fn=");
+                        client.print(filename);
+                        client.print("\">");
+                        client.print(filename);
+                        String file_dt = get_latest_datetime(filename, false);
+                        client.print("</a>");
+                        if (file_dt.length() > 2){
+                          client.print(" from ");
+                          client.print(file_dt);
+                        }
+                        client.print("</td><td>");
+                        client.print(entry.size()/1024);
+                        client.print(" kb</td><td>");
+                        if (wigle_file_reference.fid == 0){
+                          client.print("Not uploaded");
+                        } else {
+                          client.print("Uploaded. ");
+                          if (wigle_file_reference.wait != true){
+                            client.print(wigle_file_reference.total_gps);
+                            client.print(" total WiFi (");
+                            client.print(wigle_file_reference.discovered_gps);
+                            client.print(" new)");
+                          } else {
+                            client.print("Not yet processed");
+                          }
+                        }
+                        client.print("</td><td>");
+                        if (filename.endsWith(".bin") || filename.endsWith(".csv")){
+                          client.print("<p><a href=\"/delete?fn=");
+                          client.print(filename);
+                          client.print("\">");
+                          client.print("Delete</a></p><p><a href=\"/upload?fn=");
+                          client.print(filename);
+                          client.print("\">Upload</a>");
+                        }
+                        client.println("</td></tr>");
+                      }
+                    }
+                    client.print("</table><br><hr>");
+                    if (!ota_optout){
+                      client.println("<p>No longer want OTA updates? <a href=\"/ota_change_pref\">Opt-out</a></p>");
+                    }
+                    client.print("<h2>Upload firmware</h2>");
+                    client.print("<p>Your wardriver will automatically find new updates, but you can also manually upload them using this form</p>");
+                    client.print("<input type=\"file\" id=\"file\" /><br><button id=\"read-file\">Read File</button>");
+                    client.print("<p>The upload will take 1-3 minutes and there is no progress bar in this browser, check the wardriver LCD during upload</p><br>");
+                    client.print("<br><br>Currently installed: v");
+                    client.println(VERSION);
+                    
+                    if (ota_latest_stable.length() > 1 || ota_latest_beta.length() > 1){
+                      client.println("<br><hr><strong>Available software versions</strong>");
+                      if (ota_latest_stable.length() > 1 && ota_latest_stable != VERSION){
+                        client.print("<p>Latest stable version: <a href=\"dlupdate?v=s\">");
+                        client.print(ota_latest_stable);
+                        client.print("</a>");
+                      }
+                      if (ota_latest_beta.length() > 1 && ota_latest_beta != VERSION){
+                        client.print("</p><p>Latest beta: <a href=\"/dlupdate?v=b\">");
+                        client.print(ota_latest_beta);
+                        client.print("</a>");
+                      }
+                      client.println("</p><p>Your wardriver should automatically find the best version to install, but you can choose a specific version to install above.");
+                    }
+                    //The very bottom of the homepage contains this JS snippet to send the current epoch value from the browser to the wardriver
+                    //Also a snippet to force binary uploads instead of multipart.
+                    client.println("<script>const ep=Math.round(Date.now()/1e3);var x=new XMLHttpRequest;x.open(\"GET\",\"time?v=\"+ep,!1),x.send(null); document.querySelector(\"#read-file\").addEventListener(\"click\",function(){if(\"\"==document.querySelector(\"#file\").value){alert(\"no file selected\");return}var e=document.querySelector(\"#file\").files[0],n=new FileReader;n.onload=function(n){let t=new XMLHttpRequest;var l=e.name;t.open(\"POST\",\"/fw?n=\"+l,!0),t.onload=e=>{window.location.href=\"/fwup\"};let r=new Blob([n.target.result],{type:\"application/octet-stream\"});t.send(r)},n.readAsArrayBuffer(e)});</script>");
+                  }
+
+                  if (buff.indexOf("GET /repupdate") > -1){
+                    //Would be really great to stop hardcoding this one day.
+                    ESP_LOGD(LOG_TAG_GENERIC, "Replace updates requested");
+                    SD.remove("/A.bin");
+                    SD.remove("/B.bin");
+                    client.println("Content-type: text/html");
+                    client.println();
+                    client.println("<meta http-equiv=\"refresh\" content=\"1; URL=/dlupdate\" />Redirecting..");
+                    client.flush();
+                    delay(5);
+                    client.stop();
+                  }
+
+                  if (buff.indexOf("GET /dlupdate") > -1){
+                    ESP_LOGD(LOG_TAG_GENERIC, "dlupdate requested");
+                    boolean install_stable = is_stable;
+                    if (buff.indexOf("?v=b") > -1){
+                      install_stable = false;
+                      ESP_LOGV(LOG_TAG_GENERIC, "beta requested");
+                    }
+                    if (buff.indexOf("?v=s") > -1){
+                      install_stable = true;
+                      ESP_LOGV(LOG_TAG_GENERIC, "stable requested");
+                    }
+                    
+                    client.println("Content-type: text/html");
+                    client.println();
+                    client.print("<h1>Downloading updates. Check the wardriver LCD for progress</h1>");
+                    client.print("Check <a href=\"/fwup\">this page</a> once the download is complete");
+                    client.print("\n\r\n\r");
+                    client.flush();
+                    delay(5);
+                    client.stop();
+                    check_for_updates(install_stable, true);
+                  }
+
+                  if (buff.indexOf("GET /wigle-setup") > -1){
+                    ESP_LOGD(LOG_TAG_GENERIC, "Sending wigle-setup page");
+                    client.println("Content-type: text/html");
+                    client.println();
+                    client.print("<style>html{font-size:21px;text-align:center;padding:20px}input[type=text],input[type=password],input[type=submit],select{padding:5px;width:100%;max-width:1000px}form{padding-top:10px}br{display:block;margin:5px 0}</style>");
+                    client.print("<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"><h2>WiGLE Configuration</h2>");
+                    client.print("<p>Your device can upload captured data directly to WiGLE. Please provide a WiGLE API key below. This can be found at https://wigle.net/account</p>");
+                    if (wigle_api_key.length() > 2){
+                      client.print("<p>An API key is already set. Leave the value as 'configured' unless you wish to change it.</p>");
+                    }
+                    client.print("<form method=\"get\" action=\"/wcfg\">API Key ('encoded for use'):<input type=\"text\" name=\"akey\" id=\"akey\" value=\"");
+                    if (wigle_api_key.length() > 2){
+                      client.print("configured");
+                    }
+                    client.print("\"><br><br><input type=\"submit\" value=\"Submit\"><p><label for=\"commercial\"><input type=\"checkbox\" id=\"commercial\" name=\"commercial\" value=\"commercial\" ");
+                    if (wigle_commercial){
+                      client.print("checked");
+                    }
+                    client.println("> Allow WiGLE to use this data commercially</label></p>");
+                    client.print("<p><label for=\"autoupload\"><input type=\"checkbox\" id=\"autoupload\" name=\"autoupload\" value=\"autoupload\" ");
+                    if (wigle_autoupload){
+                      client.print("checked");
+                    }
+                    client.print(">Automatically upload files when device starts up</label></p></form>");
+                    
+                    client.println("<br><hr>Additional help is available at https://wardriver.uk</html>");
+
+                  }
+
+                  if (buff.indexOf("GET /wcfg?") > -1){
+                    ESP_LOGD(LOG_TAG_GENERIC, "Got WiGLE config");
+                    client.println("Content-type: text/html");
+                    client.println();
+                    
+                    if (buff.indexOf("&commercial=commercial") > -1){
+                      wigle_commercial = true;
+                      //Really, lets use POST requests for this soon.
+                      buff.replace("&commercial=commercial","");
+                      ESP_LOGV(LOG_TAG_GENERIC, "WiGLE commercial optin selected");
+                    } else {
+                      wigle_commercial = false;
+                    }
+                    preferences.putBool("wigle_com", wigle_commercial);
+
+                    if (buff.indexOf("&autoupload=autoupload") > -1){
+                      wigle_autoupload = true;
+                      buff.replace("&autoupload=autoupload","");
+                      preferences.putLong("wigle_mf", bootcount);
+                      ESP_LOGV(LOG_TAG_GENERIC, "WiGLE autoupload enabled");
+                    } else {
+                      wigle_autoupload = false;
+                    }
+                    preferences.putBool("wigle_au", wigle_autoupload);
+                    int startpos = buff.indexOf("?akey=")+6;
+                    int endpos = buff.indexOf(" HTTP");
+                    String set_api_key = GP_urldecode(buff.substring(startpos,endpos));
+                    set_api_key.trim(); // Ignore whitespace introduced by copy/paste.
+                    
+                    if (set_api_key != "configured"){
+                      wigle_api_key = set_api_key;
+                    }
+                    
+                    preferences.putString("wigle_api_key", wigle_api_key);
+    
+                    client.print("<h1>Thanks!</h1>Please wait. <meta http-equiv=\"refresh\" content=\"1; URL=/\" />");
+
+                    wigle_load_history();
+                    
+                  }
+
+                  if (buff.indexOf("GET /ota_change_pref") > -1){
+                    ESP_LOGD(LOG_TAG_GENERIC, "Toggle OTA prefs");
+                    ota_optout = !ota_optout;
+                    client.println("Content-type: text/html");
+                    client.println();
+                    client.println("<meta http-equiv=\"refresh\" content=\"1; URL=/\" />");
+                    client.flush();
+                    preferences.putBool("ota_optout", ota_optout);
+                    
+                  }
+
+                  if (buff.indexOf("GET /fwup") > -1){
+                    client.println("Content-type: text/html");
+                    client.println();
+                    ESP_LOGD(LOG_TAG_GENERIC, "Sending FW update page");
+                    client.println("<style>#hide{display:none}html,td,th{font-size:21px;text-align:center;padding:20px }table{padding:5px;width:100%;max-width:1000px;}td, th{border: 1px solid #999;padding: 0.5rem;}</style>");
+                    client.println("<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"><h1>wardriver.uk updater</h1></head>");
+                    client.println("<body><p>This page may take a while to load since hashes are generated for each file.</p>");
+                    client.println("Check the wardriver LCD for progress updates.</p><br>");
+                    client.println("<table><tr><th>Filename</th><th>SHA256</th><th>Opt</th></tr>");
+                    client.flush();
+                    for (int x = 0; x < 32; x++){
+                      //Add some rows which often triggers rendering, these are invisible.
+                      client.println("<tr id=\"hide\"><td>-</td><td>-</td><td>-</td></tr>");
+                    }
+                    client.flush();
+
+                    //In future lets iterate *.bin
+                    if (SD.exists("/A.bin")){
+                      String filehash = file_hash("/A.bin");
+                      String check_result = online_hash_check(filehash);
+                      String color = "red";
+                      String emoji = "&#9888;"; //warning
+                      if (check_result != ""){
+                        color = "green";
+                        emoji = "&#128274;"; //lock
+                      }
+                      client.println("<tr><td>A.bin</td><td><p style=\"color:" + color + "\">" + filehash + " " + emoji + "</p><p>" + check_result + "</p></td><td><a href=\"/fwins?h=" + filehash + "&n=/A.bin\">Install</a></td></tr>");
+                      client.flush();
+                    }
+                    if (SD.exists("/B.bin")){
+                      String filehash = file_hash("/B.bin");
+                      String installed_hash = preferences.getString("b_checksum");
+                      if (filehash != installed_hash){
+                        String check_result = online_hash_check(filehash);
+                        String color = "red";
+                        String emoji = "&#9888;"; //warning
+                        if (check_result != ""){
+                          color = "green";
+                          emoji = "&#128274;"; //lock
+                        }
+                        client.println("<tr><td>B.bin</td><td><p style=\"color:" + color + "\">" + filehash + " " + emoji + "</p><p>" + check_result + "</td><td><a href=\"/fwins?h=" + filehash + "&n=/B.bin\">Install</a></td></tr>");
+                      } else {
+                        ESP_LOGI(LOG_TAG_GENERIC, "Side B hash match, will delete B.bin. Hash = %s", filehash.c_str());
+                        SD.remove("/B.bin");
+                      }
+                    }
+                    client.println("</tr></body>");
+                    
+                  }
+
+                  if (buff.indexOf("GET /fwins") > -1) {
+                    int startpos = buff.indexOf("?h=") + 3;
+                    int endpos = buff.indexOf("&");
+                    String expect_hash = GP_urldecode(buff.substring(startpos, endpos));
+                    startpos = buff.indexOf("&n=") + 3;
+                    endpos = buff.indexOf(" HTTP");
+                    String fw_filename = GP_urldecode(buff.substring(startpos, endpos));
+
+                    client.println("Content-type: text/html");
+                    client.println();
+                    ESP_LOGD(LOG_TAG_GENERIC, "Firmware install requested, file = %s, hash = %s", fw_filename.c_str(), expect_hash.c_str());
+
+                    if (expect_hash.length() > 0 && SD.exists(fw_filename)) {
+                      ESP_LOGD(LOG_TAG_GENERIC, "Prepare to install update");
+                      client.print("<h1>Firmware will now be installed. Check the wardriver LCD for progress</h1>");
+                      client.print("\n\r\n\r");
+                      client.flush();
+                      delay(5);
+                      client.stop();
+                      boolean install_result = install_firmware(fw_filename, expect_hash);
+                      if (!install_result){
+                        ESP_LOGD(LOG_TAG_GENERIC, "Update failed");
+                        clear_display();
+                        display.println("Update failed");
+                        display.display();
+                        delay(5000);
+                      } else {
+                        //Install worked.
+                        if (fw_filename == "/B.bin"){
+                          preferences.putString("b_checksum", expect_hash);
+                        }
+                      }
+                    } else {
+                      client.print("<h1>Error verifying update</h1>");
+                    }
+                  }
+
+                  if (buff.indexOf("POST /fw") > -1){
+                    int startpos = buff.indexOf("?n=")+3;
+                    int endpos = buff.indexOf(" ",startpos);
+                    String bin_filename = buff.substring(startpos,endpos);
+
+                    ESP_LOGD(LOG_TAG_GENERIC, "Incoming firmware %s", bin_filename.c_str());
+                    String newname = "/other.bin";
+                    if (bin_filename.startsWith("A")){
+                      newname = "/A.bin";
+                    }
+                    if (bin_filename.startsWith("B")){
+                      newname = "/B.bin";
+                    }
+
+                    ESP_LOGD(LOG_TAG_GENERIC, "Will save incoming firmware as %s", newname.c_str());
+                    if (SD.exists(newname)){
+                      SD.remove(newname);
+                    }
+                    File binwriter = SD.open(newname, FILE_WRITE);
+
+                    clear_display();
+                    display.println("Firmware upload");
+                    display.display();
+
+                    unsigned long fw_last_byte = millis();
+                    byte bbuf[2] = {0x00, 0x00};
+                    unsigned long bytesin = 0;
+                    while (1) {
+                      if (client.available()){
+                        byte c = client.read();
+                        bytesin++;
+                        binwriter.write(c);
+                        bbuf[0] = c;
+                        
+                        fw_last_byte = millis();
+                        if (bytesin % 4096 == 0){
+                          clear_display();
+                          display.println("Firmware upload");
+                          display.print(bytesin / 1024);
+                          display.println("kb received");
+                          display.display();
+                        }
+                      }
+                      if (millis() - fw_last_byte > 4000){
+                        ESP_LOGD(LOG_TAG_GENERIC, "Incoming firmware saved");
+                        
+                        binwriter.flush();
+                        binwriter.close();
+                        break;
+                      }
+                    } //Firmware update loop
+                  }
+
+                  if (buff.indexOf("GET /time?") > -1){
+                    client.println("Content-type: text/html");
+                    
+                    int startpos = buff.indexOf("?v=")+3;
+                    int endpos = buff.indexOf(" ",startpos);
+                    String newtime_str = buff.substring(startpos,endpos);
+                    unsigned long newtime = atol(newtime_str.c_str());
+                    if (get_epoch() < YEAR_2020){
+                      //if the epoch value is set to something before 2020, we can be quite sure it is inaccurate.
+                      if (newtime > YEAR_2020){
+                        //A very basic validity test for the datetime value issued by the client.
+                        
+                        set_sys_clock(newtime);
+                        ESP_LOGI(LOG_TAG_GENERIC, "Updated local time from connected client to %u", newtime);
+                      }
+                    }
+                  }
+
+                  if (buff.indexOf("GET /upload?") > -1) {
+                    int startpos = buff.indexOf("?fn=")+4;
+                    int endpos = buff.indexOf(" ",startpos);
+                    String filename = buff.substring(startpos,endpos);
+                    ESP_LOGD(LOG_TAG_GENERIC, "File upload request for %s", filename.c_str());
+                    if (!SD.exists(filename)){
+                      ESP_LOGW(LOG_TAG_GENERIC, "File upload request, but file does not exist: %s", filename.c_str());
+                      client.println("Content-type: text/html");
+                      client.println();
+                      client.print("<h1>File not found </h1>");
+                      client.println("<meta http-equiv=\"refresh\" content=\"1; URL=/\" />");
+                    } else {
+                      client.println("Content-type: text/html");
+                      client.println();
+                      client.print("<style>html,td,th{font-size:21px;text-align:center;padding:20px}</style><html>");
+                      client.print("<h1>Uploading");
+                      client.print(filename);
+                      client.print("</h1><h2>Check LCD for progress");
+                      client.print("</h2>Once complete, <a href=\"/\">click here</a> to continue.</html>");
+                      client.flush();
+                      delay(5);
+                      client.stop();
+                      boolean success = wigle_upload(filename);
+                      if (success == true){
+                        ESP_LOGD(LOG_TAG_GENERIC, "File upload complete");
+                        clear_display();
+                        display.println("Uploaded OK");
+                        display.display();
+                        delay(1000);
+                        wigle_load_history();
+                      }
+                    }
+                  }
+
+                  if (buff.indexOf("GET /delete?") > -1) {
+                    ESP_LOGD(LOG_TAG_GENERIC, "File delete request (pre-confirmation)");
+                    int startpos = buff.indexOf("?fn=")+4;
+                    int endpos = buff.indexOf(" ",startpos);
+                    String filename = buff.substring(startpos,endpos);
+                    if (!SD.exists(filename)){
+                      ESP_LOGW(LOG_TAG_GENERIC, "Cannot delete %s since it does not exist", filename.c_str());
+                      client.println("Content-type: text/html");
+                      client.println();
+                      client.print("<h1>File not found </h1>");
+                      client.println("<meta http-equiv=\"refresh\" content=\"1; URL=/\" />");
+                    } else {
+                      client.println("Content-type: text/html");
+                      client.println();
+                      client.print("<style>html,td,th{font-size:21px;text-align:center;padding:20px}</style><html>");
+                      client.print("<h1>Confirm delete of ");
+                      client.print(filename);
+                      client.print("<br><a href=\"/\">Cancel</a></h1><br><h2><a href=\"/confirmdelete?fn=");
+                      client.print(filename);
+                      client.print("\">DELETE</a></h2></html>");
+                    }
+                  }
+
+                  if (buff.indexOf("GET /confirmdelete?") > -1) {
+                    ESP_LOGD(LOG_TAG_GENERIC, "File delete request");
+                    int startpos = buff.indexOf("?fn=")+4;
+                    int endpos = buff.indexOf(" ",startpos);
+                    String filename = buff.substring(startpos,endpos);
+                    if (!filename.endsWith(".csv") && !filename.endsWith(".bin")){
+                      //Prevent accessing non-csv files, with the exception of test.txt
+                      ESP_LOGW(LOG_TAG_GENERIC, "User is not allowed to delete %s", filename.c_str());
+                      client.println("Content-type: text/html");
+                      client.println();
+                      client.print("Not allowed");
+                      client.flush();
+                      delay(5);
+                      client.stop();
+                    }
+                    
+                    ESP_LOGI(LOG_TAG_GENERIC, "Will now delete", filename.c_str());
+                    SD.remove(filename);
+                    client.println("Content-type: text/html");
+                    client.println();
+                    client.print("<h1>Deleted ");
+                    client.print(filename);
+                    client.println("</h1>");
+                    client.println("<meta http-equiv=\"refresh\" content=\"1; URL=/\" />");
+                    
+                  }
+
+                  if (buff.indexOf("GET /download?") > -1) {
+                    int startpos = buff.indexOf("?fn=")+4;
+                    int endpos = buff.indexOf(" ",startpos);
+                    String filename = buff.substring(startpos,endpos);
+                    if (!filename.endsWith(".csv") && filename != "/test.txt"){
+                      //Prevent accessing non-csv files, with the exception of test.txt
+                      ESP_LOGW(LOG_TAG_GENERIC, "User is not allowed to download %s", filename.c_str());
+                      client.println("Content-type: text/html");
+                      client.println();
+                      client.print("Not allowed");
+                      client.flush();
+                      delay(5);
+                      client.stop();
+                      buff = "";
+                      filename = "";
+                      break;
+                    }
+
+                    ESP_LOGD(LOG_TAG_GENERIC, "Client is downloading %s", filename.c_str());
+                    File reader = SD.open(filename, FILE_READ);
+                    if (!reader){
+                      ESP_LOGW(LOG_TAG_GENERIC, "Failed to open %s for download", filename.c_str());
+                      client.println("Content-type: text/html");
+                      client.println();
+                      client.print("Invalid file");
+                      client.flush();
+                      delay(5);
+                      client.stop();
+                      buff = "";
+                      break;
+                    }
+                    if (reader){
+                      ESP_LOGV(LOG_TAG_GENERIC, "Sending file now");
+                      client.println("Content-type: text/csv");
+                      client.print("Content-Disposition: attachment; filename=\"");
+                      client.print(generate_filename(filename));
+                      client.println("\"");
+                      client.print("Content-Length: ");
+                      client.print(reader.size());
+                      client.println();
+                      client.println();
+                      client.flush();
+                      delay(2);
+                      client.write(reader);
+                      reader.close();
+                      ESP_LOGV(LOG_TAG_GENERIC, "File sent");
+                    }
+                  }
+
+                  
+                  if (client.connected()){
+                    client.print("\n\r\n\r");
+                    client.flush();
+                    delay(5);
+                    client.stop();
+                    ESP_LOGV(LOG_TAG_GENERIC, "End of connection");
+                  }
+                  buff = "";
+                  disconnectat = millis() + web_timeout;
+                }
+                newline = true;
+              } else {
+                if (c != '\r'){
+                  newline = false;
+                }
+              }
+              
+            } else {
+              if (created_network){
+                display.print("SSID:");
+                display.println(fb_ssid);
+                display.println(fb_IP);
+              } else {
+                display.println("Connected");
+                display.println(WiFi.localIP());
+              }
+              display.print((disconnectat - millis())/1000);
+              display.println("s until boot");
+              display.print(device_type_string());
+              display.display();
+            }
+          } //while client connected
+        } //if client
+      } //while wifi
+    } //if wifi
+  }
+  preferences.end();
+}
+
+boolean change_pcb_baud_now(unsigned long baud_to_use){
+  //Change baud rate on Serial1 (A<->B) immediately, without testing or confirming anything. No automatic revert on failure.
+  //Do not call this directly, unless you have a good reason. Use change_pcb_baud() instead.
+  ESP_LOGI(LOG_TAG_GENERIC, "Now changing baud to %u", baud_to_use);
+  Serial1.flush();
+  delay(5);
+  Serial1.end();
+  delay(20);
+  Serial1.begin(baud_to_use,SERIAL_8N1,PCB_UART_TX_PIN,PCB_UART_RX_PIN);
+  Serial1.flush();
+  return true;
+}
+
+boolean change_pcb_baud(unsigned long newbaud, unsigned long oldbaud){
+  //Change baud rate on Serial1 (A<->B). Can be run at any time, but requires an already-working connection.
+  //The new rate will be tested and confirmed. Returns true if the tests pass, returns false if the old rate was reverted.
+  ESP_LOGI(LOG_TAG_GENERIC, "About to change baud from %u to %u", oldbaud, newbaud);
+
+  Serial1.flush();
+  delay(20);
+  while (Serial1.available()){
+    Serial1.read();
+  }
+  Serial1.print("NEWBAUD:");
+  Serial1.println(newbaud);
+  Serial1.flush();
+
+  //How long to wait for a response:
+  unsigned long stop_time = millis() + 1500;
+  boolean to_proceed = false;
+  boolean got_some_data = false;
+  String buff = "";
+  while (millis() < stop_time){
+    buff = "";
+    buff = Serial1.readStringUntil('\n');
+    ESP_LOGV(LOG_TAG_GENERIC, "Changebaud buff = %s", buff.c_str());
+    if (buff.length() > 1){
+      got_some_data = true;
+    }
+    if (buff.indexOf("OKTOCHANGE") >= 0){
+      to_proceed = true;
+    }
+  }
+  if (!to_proceed && !got_some_data){
+    ESP_LOGW(LOG_TAG_GENERIC, "Side B was silent. Will change baud immediately, without confirmation, in case B is already there");
+    change_pcb_baud_now(newbaud);
+    Serial1.flush();
+    delay(100);
+    while(Serial1.available()){
+      Serial1.read();
+    }
+    stop_time = millis() + 5000;
+    while (millis() < stop_time){
+      buff = "";
+      buff = Serial1.readStringUntil('\n');
+      ESP_LOGV(LOG_TAG_GENERIC, "newbaud listener buff = %s", buff.c_str());
+      if (buff.length() > 1){
+        got_some_data = true;
+      }
+    }
+    if (!got_some_data){
+      ESP_LOGW(LOG_TAG_GENERIC, "Reverting baud to %u", oldbaud);
+      change_pcb_baud_now(oldbaud);
+      to_proceed = false;
+    } else {
+      //Seems B is already on the new baud, but need to verify that somehow.
+      //Will just continue, and hope the error detection later catches the problem if this is a false-positive.
+      ESP_LOGW(LOG_TAG_GENERIC, "Baud is now %u, but ESP-B did not handshake properly and was likely already at this baud. Will proceed.", newbaud);
+      pcb_baud_rate = newbaud;
+      return true;
+    }
+  }
+  if (!to_proceed){
+    ESP_LOGW(LOG_TAG_GENERIC, "Abort baud rate change, no response from side B");
+    return false;
+  }
+  change_pcb_baud_now(newbaud);
+
+  for (int i = 0; i < 50; i++){
+    //Send a lot of 1/0 transitions to help the clocks stabilize
+    Serial1.write(0xAA);
+    Serial1.flush();
+    if (Serial1.available()){
+      Serial1.read();
+    }
+    delay(10);
+  }
+
+  delay(30);
+
+  while (Serial1.available()){
+    //Ensure the buffers are empty
+    Serial1.flush();
+    Serial1.read();
+  }
+  Serial1.flush();
+
+  int success_count = 0;
+  for (int i = 0; i < 200; i++){
+    byte rand = esp_random();
+    byte rand_read = 0x00;
+    Serial1.write(rand);
+    Serial1.flush();
+    delay(20);
+    if (Serial1.available()){
+      while (Serial1.available()){
+        //Ensure we always work with the final byte in the buffer, in case it wasn't properly flushed.
+        rand_read = Serial1.read();
+        if (Serial1.available()){
+          ESP_LOGV(LOG_TAG_GENERIC, "Read an unexpected extra byte: %x", rand_read);
+          delay(2);
+        }
+      }
+      if (rand != rand_read){
+        ESP_LOGV(LOG_TAG_GENERIC, "Wanted %x but got %x", rand, rand_read);
+        //test_passed = false;
+        //break;
+        success_count = 0;
+      } else {
+        ESP_LOGV(LOG_TAG_GENERIC, "MATCH: %x is %x", rand, rand_read);
+        success_count++;
+      }
+    } else {
+      ESP_LOGV(LOG_TAG_GENERIC, "Nothing to read");
+    }
+  }
+
+  if (success_count < 90){
+    ESP_LOGW(LOG_TAG_GENERIC, "Baud rate change failed, reverting to %u", oldbaud);
+    change_pcb_baud_now(oldbaud);
+    return false;
+  }
+
+  boolean was_successful = false;
+
+  for (int i = 0; i < 12; i++){
+    Serial1.println("KEEPBAUD");
+    Serial1.flush();
+    delay(30);
+    String resp_buff = Serial1.readStringUntil('\n');
+    ESP_LOGV(LOG_TAG_GENERIC, "resp_buff = %s", resp_buff.c_str());
+    if (resp_buff.indexOf("WILLKEEP") >= 0){
+      was_successful = true;
+      break;
+    }
+    if (resp_buff.indexOf("KEEPBAUD") >= 0){
+      ESP_LOGD(LOG_TAG_GENERIC, "Side B still in loopback, will wait a while and flush buffers");
+      Serial1.flush();
+      delay(1000);
+      while (Serial1.available()){
+        Serial1.read();
+      }
+    }
+  }
+
+  if (!was_successful){
+    ESP_LOGW(LOG_TAG_GENERIC, "Baud rate change failed, reverting to %u", oldbaud);
+    change_pcb_baud_now(oldbaud);
+    return false;
+  }
+
+  pcb_baud_rate = newbaud;
+  ESP_LOGI(LOG_TAG_GENERIC, "Baud rate changed to %u successfully", newbaud);
+
+  return true;
+}
+
+void push_config(String key){
+  //Send a config option to side B.
+  String value = get_config_option(key);
+  Serial1.print("PUSH:");
+  Serial1.print(key);
+  Serial1.print("=");
+  Serial1.println(value);
+  Serial1.flush();
+  ESP_LOGV(LOG_TAG_GENERIC, "Push config %s", key.c_str());
+}
+
+void send_config_to_b(){
+  ESP_LOGD(LOG_TAG_GENERIC, "Sending config options to side B");
+  //This will be called when B requests it and at boot.
+  //This should contain a bunch of push_config(xx) options.
+  push_config("sb_bw16");
+  // BlueTooth scan preference
+  push_config("scanble");
+}
+
+void setup() {
+    setup_wifi();
+    delay(500);
+    
+    Serial.begin(115200);
+    ESP_LOGI(LOG_TAG_GENERIC, "Starting v%s, build %s", VERSION.c_str(), BUILD.c_str());
+
+    for(int i=0; i<17; i=i+8) {
+      chip_id |= ((ESP.getEfuseMac() >> (40 - i)) & 0xff) << i;
+    }
+
+    ESP_LOGD(LOG_TAG_GENERIC, "Chip ID: %u", chip_id);
+
+    default_ssid.concat(" - ");
+    default_ssid.concat(chip_id);
+    default_ssid.remove(default_ssid.length()-3);
+    preferences.begin("wardriver", true);
+    
+    pcb_baud_rate = preferences.getULong("pcb_baud_rate",0);
+    if (pcb_baud_rate < PCB_BAUD_RATE_DEFAULT){
+      pcb_baud_rate = PCB_BAUD_RATE_DEFAULT;
+    }
+    if (pcb_baud_rate > MAX_PCB_BAUD_RATE_HIGH){
+      pcb_baud_rate = MAX_PCB_BAUD_RATE_HIGH;
+    }
+    preferences.end();
+
+    ESP_LOGI(LOG_TAG_GENERIC, "Using baud rate %u with Side B", pcb_baud_rate);
+    
+    Serial1.begin(pcb_baud_rate,SERIAL_8N1,PCB_UART_TX_PIN,PCB_UART_RX_PIN);
+    Serial1.setTimeout(1000);
+
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x32
+      ESP_LOGE(LOG_TAG_GENERIC, "SSD1306 allocation failed");
+    }
+    if (!rotate_display){
+      display.setRotation(2);
+    } else {
+      display.setRotation(0);
+    }
+    display.clearDisplay();
+    display.setTextSize(1);      // Normal 1:1 pixel scale
+    display.setTextColor(WHITE); // Draw white text
+    display.setCursor(0, 0);     // Start at top-left corner
+    display.cp437(true);         // Use full 256 char 'Code Page 437' font
+    display.println("Starting");
+    display.print("Version ");
+    display.println(VERSION);
+    display.display();
+    
+    int reset_reason = esp_reset_reason();
+    if (reset_reason != ESP_RST_POWERON && reset_reason != ESP_RST_SW){
+      clear_display();
+      display.println("Unexpected reset");
+      display.print("Code ");
+      display.println(reset_reason);
+      display.print("Version ");
+      display.println(VERSION);
+      display.display();
+      delay(4000);
+    }
+    delay(1500);
+
+    setup_id_pins();
+  
+    if(!SD.begin(SD_CS, SPI, SPI_FREQ)){
+        ESP_LOGE(LOG_TAG_GENERIC, "SD Begin failed!");
+        clear_display();
+        display.println("SD Begin failed!");
+        display.display();
+        delay(4000);
+    }
+    uint8_t cardType = SD.cardType();
+    ESP_LOGD(LOG_TAG_GENERIC, "SD card type is %u", cardType);
+    if(cardType == CARD_NONE){
+        ESP_LOGE(LOG_TAG_GENERIC, "No SD card is attached");
+        clear_display();
+        display.println("No SD Card!");
+        display.display();
+        delay(10000);
+    }
+  
+    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+    ESP_LOGI(LOG_TAG_GENERIC, "SD Card size: %lluMB", cardSize);
+
+    ESP_LOGD(LOG_TAG_GENERIC, "Starting GPS serial at %i baud", gps_baud_rate);
+    Serial2.begin(gps_baud_rate,SERIAL_8N1,16,17);
+
+    ESP_LOGD(LOG_TAG_GENERIC, "Attempting GPS date/time sync");
+
+    for (int x = 0; x < 3000; x++){
+      int c_count = 0;
+      while (Serial2.available()){
+        c_count++;
+        if (c_count > 128){
+          break;
+        }
+        char c = Serial2.read();
+        if (nmea.process(c)){
+          if (nmea.isValid()){
+            lastgps = millis();
+            gps_time_sync();
+          }
+        }
+      }
+      if (dt_string_from_gps() != ""){
+        break;
+      }
+      delay(1);
+    }
+    gps_time_sync();
+    ESP_LOGD(LOG_TAG_GENERIC, "Date/time is: %s", dt_string_from_gps().c_str());
+
+    while (!filewriter){
+      filewriter = SD.open("/test.txt", FILE_APPEND);
+      if (!filewriter){
+        //Do not pass this through to the logging functions since we need to be sure it doesn't get supressed.
+        Serial.println("Failed to open file for writing. Type continue to skip this check.");
+        clear_display();
+        display.println("SD File open failed!");
+        display.display();
+        String sbuff = Serial.readStringUntil('\n');
+        if (sbuff.indexOf("continue") >= 0){
+          //Since this boot is tethered to a PC and has no local storage, override some stuff.
+          nets_over_uart = true;
+          block_reconfigure = true;
+          web_timeout = 250;
+          break;
+        }
+      }
+    }
+    int wrote = filewriter.print("\n_BOOT_");
+    filewriter.print(VERSION);
+    filewriter.print(", ut=");
+    filewriter.print(micros());
+    filewriter.print(", rr=");
+    filewriter.print(reset_reason);
+    filewriter.print(", id=");
+    filewriter.print(chip_id);
+    filewriter.print(", bid=");
+    filewriter.print(read_id_pins());
+    filewriter.flush();
+    if (wrote < 1){
+      while(true){
+        //Do not pass this through to the logging functions since we need to be sure it doesn't get supressed.
+        Serial.println("Failed to write to SD card! Type continue to resume boot process.");
+        clear_display();
+        display.println("SD Card write failed!");
+        display.display();
+        String sbuff = Serial.readStringUntil('\n');
+        if (sbuff.indexOf("continue") >= 0){
+          //Since this boot is tethered to a PC and has no local storage, override some stuff.
+          nets_over_uart = true;
+          block_reconfigure = true;
+          web_timeout = 250;
+          break;
+        }
+      }
+    }
+
+    while (millis() < 9000){
+      //Side B will be ready after this long
+      yield();
+    }
+
+    bool pcb_baud_rate_changed = false;
+    send_config_to_b();
+    if (pcb_baud_rate_high != pcb_baud_rate){
+      pcb_baud_rate_changed = change_pcb_baud(pcb_baud_rate_high, pcb_baud_rate);
+    }
+    if (pcb_baud_rate_changed){
+      preferences.begin("wardriver", false);
+      preferences.putULong("pcb_baud_rate", pcb_baud_rate);
+      preferences.end();
+    }
+    
+    boot_config();
+    setup_wifi();
+
+    if (!rotate_display){
+      display.setRotation(2);
+    } else {
+      display.setRotation(0);
+    }
+
+    #define hash_log_len 5
+    String b_side_hash = "";
+    for (int x = 0; x < hash_log_len; x++){
+      b_side_hash.concat(b_side_hash_full.charAt(x));
+    }
+
+    ESP_LOGI(LOG_TAG_GENERIC, "This hardware identity is %s", device_type_string().c_str());
+    
+    filewriter.print(", bc=");
+    filewriter.print(bootcount);
+    filewriter.print(", ep=");
+    filewriter.print(get_epoch());
+    filewriter.print(", bsh=");
+    filewriter.print(b_side_hash);
+    filewriter.flush();
+    filewriter.close();
+
+    if (SD.exists("/bl.txt")){
+      ESP_LOGD(LOG_TAG_GENERIC, "Opening blocklist");
+      File blreader;
+      blreader = SD.open("/bl.txt", FILE_READ);
+      byte i = 0;
+      byte ci = 0;
+      while (blreader.available()){
+        char c = blreader.read();
+        if (c == '\n' || c == '\r'){
+          use_blocklist = true;
+          if (ci != 0){
+            i += 1;
+          }
+          ci = 0;
+        } else {
+          block_list[i].characters[ci] = c;
+          ci += 1;
+          if (ci >= blocklist_str_len){
+            ESP_LOGW(LOG_TAG_GENERIC, "Blocklist line too long!");
+            ci = 0;
+          }
+        }
+      }
+      blreader.close();
+    }
+
+    if (!use_blocklist){
+      ESP_LOGD(LOG_TAG_GENERIC, "Not using a blocklist");
+    }
+    
+    ESP_LOGD(LOG_TAG_GENERIC, "Opening destination file for writing");
+
+    String filename = "";
+    while (filename == "" || SD.exists(filename)){
+      filename = "/wd3-";
+      filename = filename + bootcount;
+      filename = filename + ".csv";
+      if (SD.exists(filename)){
+        ESP_LOGD(LOG_TAG_GENERIC, "File already exists at %s", filename.c_str());
+        bootcount++;
+        filename = "";
+        preferences.begin("wardriver", false);
+        preferences.putULong("bootcount", bootcount);
+        preferences.end();
+        ESP_LOGD(LOG_TAG_GENERIC, "Incremented bootcount to %u", bootcount);
+      }
+    }
+    
+    ESP_LOGI(LOG_TAG_GENERIC, "Opening file for main session: %s", filename.c_str());
+    filewriter = SD.open(filename, FILE_APPEND);
+    
+    filewriter.print("WigleWifi-1.4,appRelease=wardriver.uk " + VERSION + ",model=" + device_type_string() + ",release=wardriver.uk " + VERSION + ",device=" + device_string() + ",display=i2c LCD,board=" + device_board_string() + ",brand=" + device_brand_string() + "\n");
+    filewriter.println("MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type");
+    filewriter.flush();
+
+    booted_at = millis();
+    
+    clear_display();
+    display.println("Starting main..");
+    display.display();
+    started_at_millis = millis();
+    ESP_LOGI(LOG_TAG_GENERIC,"Starting main");
+
+    xTaskCreatePinnedToCore(
+      primary_scan_loop, /* Function to implement the task */
+      "primary_scan_loop", /* Name of the task */
+      10000,  /* Stack size in words */
+      NULL,  /* Task input parameter */
+      3,  /* Priority of the task */
+      &primary_scan_loop_handle,  /* Task handle. */
+      0); /* Core where the task should run */
+}
+
+unsigned long millis_main(){
+  //Return millis() but with the time in setup() removed. eg, the uptime of the actual wardriving session.
+  return millis()-booted_at;
+}
+
+void primary_scan_loop(void * parameter){
+  //This core will be dedicated entirely to WiFi scanning in an infinite loop.
+  setup_wifi();
+  while (true){
+    disp_wifi_count = wifi_count;
+    wifi_count = 0;
+    
+    for(int scan_channel = 1; scan_channel < 12; scan_channel++){
+      yield();
+      ESP_LOGV(LOG_TAG_GENERIC, "Start Scan C%i", scan_channel);
+      //scanNetworks(bool async, bool show_hidden, bool passive, uint32_t max_ms_per_chan, uint8_t channel)
+      int n = WiFi.scanNetworks(false,true,false,110,scan_channel);
+      ESP_LOGV(LOG_TAG_GENERIC, "Finish Scan C%i = %i", scan_channel, n);
+      if (n < 0){
+        //Got a scan error, add a delay to allow other tasks on this core to run and to hopefully let WiFi issues settle down
+        ESP_LOGW(LOG_TAG_GENERIC, "Scan failed, n=%i", n);
+        delay(1000);
+      }
+      if (n > 0){
+        wifi_count = wifi_count + n;
+        for (int i = 0; i < n; i++) {
+          uint8_t *this_bssid_raw = WiFi.BSSID(i);
+          char this_bssid[18] = {0};
+          sprintf(this_bssid, "%02X:%02X:%02X:%02X:%02X:%02X", this_bssid_raw[0], this_bssid_raw[1], this_bssid_raw[2], this_bssid_raw[3], this_bssid_raw[4], this_bssid_raw[5]);
+          
+          if (seen_mac(this_bssid_raw)){
+            //Skip any APs which we've already logged.
+            continue;
+          }
+          //Save the AP MAC inside the history buffer so we know it's logged.
+          save_mac(this_bssid_raw);
+
+          total_new_wifi++;
+
+          String ssid = WiFi.SSID(i);
+          ssid.replace(",","_");
+          
+          if (use_blocklist){
+            if (is_blocked(ssid)){
+              wifi_block_at = millis();
+              continue;
+            }
+            String tmp_mac_str = String(this_bssid);
+            tmp_mac_str.toUpperCase();
+            if (is_blocked(tmp_mac_str)){
+              wifi_block_at = millis();
+              continue;
+            }
+          }
+          
+          filewriter.printf("%s,%s,%s,%s,%d,%d,%s,WIFI\n", this_bssid, ssid.c_str(), security_int_to_string(WiFi.encryptionType(i)).c_str(), dt_string(get_epoch()).c_str(), WiFi.channel(i), WiFi.RSSI(i), gps_string().c_str());
+          if (nets_over_uart){
+            Serial.printf("NET=%s,%s,%s,%s,%d,%d,%s,WIFI\n", this_bssid, ssid.c_str(), security_int_to_string(WiFi.encryptionType(i)).c_str(), dt_string(get_epoch()).c_str(), WiFi.channel(i), WiFi.RSSI(i), gps_string().c_str());
+          }
+         
+        }
+      }
+      filewriter.flush();
+    }
+    yield();
+  }
+}
+
+void lcd_show_stats(){
+  //Clear the LCD then populate it with stats about the current session.
+  boolean ble_did_block = false;
+  boolean wifi_did_block = false;
+  if (millis() - wifi_block_at < 30000){
+    wifi_did_block = true;
+  }
+  if (millis() - ble_block_at < 30000){
+    ble_did_block = true;
+  }
+  clear_display();
+  display.print("WiFi:");
+  display.print(disp_wifi_count);
+  if (wifi_did_block){
+    display.print("X");
+  }
+  if (is_5ghz){
+    display.print("|");
+    display.print(count_5ghz);
+  }
+  if (int(temperature) != 0) {
+    display.print(" T:");
+    if (!tempunits_c) {   // if units are NOT Celsius, convert to Fahrenheit
+      float temperatureF = (temperature * 9.0 / 5.0) + 32.0;
+      display.print(temperatureF);
+      display.print("f");
+    } else {
+      display.print(temperature);
+      display.print("c");
+    }
+  }
+  display.println();
+  if (nmea.getHDOP() < 250 && nmea.getNumSatellites() > 0){
+    display.print("HDOP:");
+    display.print(((float)nmea.getHDOP()/10));
+    display.print(" Sats:");
+    display.print(nmea.getNumSatellites());
+    display.println(nmea.getNavSystem());
+  } else {
+    display.print("No GPS: ");
+    struct coordinates gsm_loc = gsm_get_current_position();
+    if (gsm_loc.acc > 0){
+      display.println("GSM pos OK");
+    } else {
+      display.println("No GSM pos");
+    }
+  }
+  #define B_RESET_SEARCH_TIME 20000
+  if (b_working && millis() - side_b_reset_millis > B_RESET_SEARCH_TIME){
+  display.print("BL:");
+  if (scanble) {
+    display.print(ble_count); // display BlueTooth count
+    } else {
+    display.print("OFF"); // BlueTooth scanning is OFF
+  }
+  if (ble_did_block){
+    display.print("X");
+  }
+  display.print(" GSM:");
+  display.print(disp_gsm_count);
+  display.print(" T:");
+  display.println(total_new_wifi);
+  } else {
+    if (millis_main() > 10000){
+      //Don't display an ESP-B error shortly after boot since they are often false positives.
+      if (millis() - side_b_reset_millis > B_RESET_SEARCH_TIME){
+        display.println("ESP-B NO DATA");
+      } else {
+        display.println("ESP-B RESET");
+      }
+    } else {
+      display.println("ESP-B Booting");
+    }
+  }
+  display.println(dt_string(get_epoch()));
+  display.display();
+  if (gsm_count > 0){
+    disp_gsm_count = gsm_count;
+    gsm_count = 0;
+  }
+}
+
+void loop(){
+  //The main loop for the second core; handles GPS, "Side B" communication, and LCD refreshes.
+  while (Serial2.available()){
+    char c = Serial2.read();
+    if (nmea.process(c)){
+      if (nmea.isValid()){
+        lastgps = millis();
+      }
+    }
+  }
+
+  if (Serial1.available()){
+    b_side_last_byte_ms = millis();
+    String bside_buffer = Serial1.readStringUntil('\n');
+    ESP_LOGV(LOG_TAG_GENERIC, "S1 available, bside_buffer = %s", bside_buffer.c_str());
+    if (bside_buffer.length() < 2){
+      ESP_LOGW(LOG_TAG_GENERIC, "S1 blank message/timeout %u", b_side_read_failures);
+      b_side_read_failures++;
+    } else {
+      b_side_read_failures = 0;
+    }
+    
+    String towrite = "";
+    towrite = parse_bside_line(bside_buffer);
+    if (towrite.length() > 1){
+      filewriter.print(towrite);
+      filewriter.print("\n");
+      filewriter.flush();
+      if (nets_over_uart){
+        Serial.print("NET=");
+        Serial.print(towrite);
+        Serial.print("\n");
+      }
+    }
+  }
+
+  if (millis_main() > 15000){
+    if (millis() > b_side_last_byte_ms+B_SIDE_READ_BYTE_TIMEOUT){
+      ESP_LOGV(LOG_TAG_GENERIC, "No bytes from Side B since %u", b_side_last_byte_ms);
+      b_working = false;
+    }
+    if (b_side_read_failures > B_SIDE_READ_FAILURES_TOLERATED){
+      b_working = false;
+    }
+    if (!b_working && !reverted_pcb_baud_rate && pcb_baud_rate != verified_working_pcb_baud_rate){
+      //Comms are dead, and we're not using a confirmed-working rate, so change to the other configured baud rate.
+      unsigned long newbaud = 0;
+      if (pcb_baud_rate == PCB_BAUD_RATE_DEFAULT){
+        newbaud = pcb_baud_rate_high;
+      } else {
+        newbaud = PCB_BAUD_RATE_DEFAULT;
+      }
+      ESP_LOGW(LOG_TAG_GENERIC, "Side B comms unhealthy, attempt baud rate change from %u to %u", pcb_baud_rate, newbaud);
+      change_pcb_baud_now(newbaud);
+      pcb_baud_rate = newbaud;
+      reverted_pcb_baud_rate = true;
+      b_side_last_byte_ms = millis();
+    }
+    if (reverted_pcb_baud_rate && b_working){
+      ESP_LOGI(LOG_TAG_GENERIC, "Baud rate reverted earlier, change seems good. Will persist.");
+      reverted_pcb_baud_rate = false;
+      preferences.begin("wardriver", false);
+      preferences.putULong("pcb_baud_rate", pcb_baud_rate);
+      preferences.end();
+    }
+  }
+
+  if (gsm_count > 0){
+    disp_gsm_count = gsm_count;
+  }
+  if (lcd_last_updated == 0 || millis() - lcd_last_updated > 1000){
+    gps_time_sync();
+    lcd_show_stats();
+    lcd_last_updated = millis();
+  }
+  if (auto_reset_ms != 0 && millis() > auto_reset_ms){
+    ESP_LOGI(LOG_TAG_GENERIC, "Will now restart; auto reset timer has been reached");
+    clear_display();
+    display.println("AUTO RESET");
+    display.println("Timer reached.");
+    display.display();
+    delay(1250);
+    ESP.restart();
+  }
+}
+
+void save_cell(struct cell_tower tower){
+  //Save a cell_tower struct into the recently seen array.
+  if (cell_history_cursor >= cell_history_len){
+    cell_history_cursor = 0;
+  }
+  cell_history[cell_history_cursor] = tower;
+
+  cell_history_cursor++;
+
+  ESP_LOGV(LOG_TAG_GENERIC, "save_cell: cell_history_cursor is %u", cell_history_cursor);
+}
+
+boolean is_blocked(String test_str){
+  if (!use_blocklist){
+    return false;
+  }
+  unsigned int test_str_len = test_str.length();
+  if (test_str_len == 0){
+    return false;
+  }
+  if (test_str_len > blocklist_str_len){
+    ESP_LOGV(LOG_TAG_GENERIC, "Refusing blocklist check due to length of %u: %s", test_str_len, test_str.c_str());
+    return false;
+  }
+  for (byte i=0; i<blocklist_len; i++){
+    boolean matched = true;
+    for (byte ci=0; ci<test_str_len; ci++){
+      if (test_str.charAt(ci) != block_list[i].characters[ci]){
+        matched = false;
+        break;
+      }
+    }
+    if (matched){
+      ESP_LOGV(LOG_TAG_GENERIC, "Blocklist match: %s", test_str.c_str());
+      return true;
+    }
+  }
+  return false;
+}
+
+void replace_cell(struct cell_tower tower1, struct cell_tower tower2){
+  //Provide two cell_tower structs; the first will be looked up in the history buffer and the second will replace the found object.
+  //Only mcc, mnc, lac, and cellid are used for comparisons. Use this function to update the coordinates part of the tower object.
+
+  for (int x = 0; x < cell_history_len; x++){
+    if (cell_cmp(tower1, cell_history[x])){
+      cell_history[x] = tower2;
+    }
+  }
+}
+
+boolean cell_cmp(struct cell_tower tower, struct cell_tower tower2){
+  //Provide 2 cell_tower structs to return a boolean indicating if they match or not (based on mcc, mnc, cellid, and lac)
+  if (tower.mcc == tower2.mcc and tower.mnc == tower2.mnc and tower.cellid == tower2.cellid and tower.lac == tower2.lac){
+    return true;
+  }
+  return false;
+}
+
+boolean seen_cell(struct cell_tower tower){
+  //Return true if the cell_tower provided is in the recently seen array.
+  //This will also update the seenat and strength values within the recently seen array.
+  for (int x = 0; x < cell_history_len; x++){
+    if (cell_cmp(tower, cell_history[x])){
+      cell_history[x].seenat = millis();
+      cell_history[x].strength = tower.strength;
+      return true;
+    }
+  }
+  return false;
+}
+
+struct cell_tower get_tower(struct cell_tower tower){
+  //Provide a cell_tower object (mcc,mnc,lac,cellid) and the full object in RAM will be returned including seenat and pos.
+  //Will return a zero'd object if the tower isn't in RAM. Call seen_cell first to be sure the object you need is actually in RAM.
+
+  struct coordinates empty_pos;
+  empty_pos = (coordinates){.lat = 0, .lon = 0, .acc = 0};
+  struct cell_tower toreturn;
+  toreturn = (cell_tower){.mcc = 0, .mnc = 0, .lac = 0, .cellid = 0, .seenat = 0, .strength = 0, .pos = empty_pos};
+
+  for (int x = 0; x < cell_history_len; x++){
+    if (cell_cmp(tower, cell_history[x])){
+      toreturn = cell_history[x];
+    }
+  }
+  
+  return toreturn;
+}
+
+void save_mac(unsigned char* mac){
+  //Save a MAC address into the recently seen array.
+  if (mac_history_cursor >= mac_history_len){
+    mac_history_cursor = 0;
+  }
+  struct mac_addr tmp;
+  for (int x = 0; x < 6 ; x++){
+    tmp.bytes[x] = mac[x];
+  }
+
+  mac_history[mac_history_cursor] = tmp;
+  mac_history_cursor++;
+  ESP_LOGV(LOG_TAG_GENERIC, "save_mac mac_history_cursor = %u", mac_history_cursor);
+}
+
+boolean seen_mac(unsigned char* mac){
+  //Return true if this MAC address is in the recently seen array.
+
+  struct mac_addr tmp;
+  for (int x = 0; x < 6 ; x++){
+    tmp.bytes[x] = mac[x];
+  }
+
+  for (int x = 0; x < mac_history_len; x++){
+    if (mac_cmp(tmp, mac_history[x])){
+      return true;
+    }
+  }
+  return false;
+}
+
+boolean mac_cmp(struct mac_addr addr1, struct mac_addr addr2){
+  //Return true if 2 mac_addr structs are equal.
+  for (int y = 0; y < 6 ; y++){
+    if (addr1.bytes[y] != addr2.bytes[y]){
+      return false;
+    }
+  }
+  return true;
+}
+
+String parse_bside_line(String buff){
+  //Provide a String which contains a line from ESP32 side B.
+  //A String will be returned which should be written to the Wigle CSV.
+
+  /*
+  I am aware that this code isn't great..
+  I'm not a huge fan of Strings, especially not this many temporary Strings but it's a quick way to get things working.
+  Hopefully the large amount of RAM on the ESP32 will prevent heap fragmentation issues but I'll do extended uptime tests to be sure.
+  
+  This code sucessfully ran for 48 hours straight starting on the 1st September 2021.
+  Multiple tests have since completed with no crashes or issues. While it looks scary, it seems to be stable.
+  */
+  
+  String out = "";
+  if (buff.indexOf("SEND_CONF") > -1) {
+    send_config_to_b();
+    return out;
+  }
+  
+  if (buff.indexOf("BL,") > -1) {
+    
+    int startpos = buff.indexOf("BL,")+3;
+    int endpos = buff.indexOf(",",startpos);
+    String rssi = buff.substring(startpos,endpos);
+
+    startpos = endpos+1;
+    endpos = buff.indexOf(",",startpos);
+    String mac_str = buff.substring(startpos,endpos);
+
+    startpos = endpos+1;
+    String ble_name = buff.substring(startpos,buff.length()-1);
+
+    unsigned char mac_bytes[6];
+    int values[6];
+
+    if (is_blocked(ble_name) || is_blocked(mac_str)){
+      out = "";
+      ESP_LOGV(LOG_TAG_GENERIC, "Blocked BLE entry (from B): %s / %s", ble_name.c_str(), mac_str.c_str());
+      ble_block_at = millis();
+      return out;
+    }
+
+    if (6 == sscanf(mac_str.c_str(), "%x:%x:%x:%x:%x:%x%*c", &values[0], &values[1], &values[2], &values[3], &values[4], &values[5])){
+      for(int i = 0; i < 6; ++i ){
+          mac_bytes[i] = (unsigned char) values[i];
+      }
+    
+      if (!seen_mac(mac_bytes)){
+        save_mac(mac_bytes);
+        //Save to SD?
+        ESP_LOGV(LOG_TAG_GENERIC, "New BLE device, buff = %s", buff.c_str());
+
+        mac_str.toUpperCase();
+        out = mac_str + "," + ble_name + "," + "[BLE]," + dt_string(get_epoch()) + ",0," + rssi + "," + gps_string() + ",BLE";
+      }
+    }
+  }
+
+  if (buff.indexOf("RESET=") > -1) {
+    if (millis() - started_at_millis < 10000){
+      //We will ignore this if we recently started running because then it's normal behavior, not a fault.
+      ESP_LOGD(LOG_TAG_GENERIC, "Ignoring msg from B due to uptime, buff = %s", buff.c_str());
+      return out;
+    }
+    String b_reset_reason = buff;
+    b_reset_reason.replace("RESET=","");
+    b_reset_reason.replace("\r","");
+    b_reset_reason.replace("\n","");
+    ESP_LOGW(LOG_TAG_GENERIC, "B reports reset with code %s", b_reset_reason.c_str());
+
+    File testfilewriter = SD.open("/test.txt", FILE_APPEND);
+    testfilewriter.print("\n\r_B-RST_");
+    testfilewriter.print(b_reset_reason);
+    testfilewriter.print(",ut=");
+    testfilewriter.print(millis());
+    testfilewriter.print(",blc=");
+    testfilewriter.print(ble_count);
+    testfilewriter.print(",ep=");
+    testfilewriter.println(get_epoch());
+    testfilewriter.close();
+    b_working = false;
+    side_b_reset_millis = millis();
+
+    return out;
+
+  }
+
+  if (buff.indexOf("WI0,") > -1) {
+    //WI0,SSID,6,-88,5,00:00:00:00:00:00
+    int startpos = buff.indexOf("WI0,")+4;
+    int endpos = buff.indexOf(",",startpos);
+    String ssid = buff.substring(startpos,endpos);
+
+    startpos = endpos+1;
+    endpos = buff.indexOf(",",startpos);
+    String channel = buff.substring(startpos,endpos);
+
+    startpos = endpos+1;
+    endpos = buff.indexOf(",",startpos);
+    String rssi = buff.substring(startpos,endpos);
+
+    startpos = endpos+1;
+    endpos = buff.indexOf(",",startpos);
+    String security_raw = buff.substring(startpos,endpos);
+
+    startpos = endpos+1;
+    endpos = startpos+17;
+    String mac_str = buff.substring(startpos,endpos);
+    mac_str.toUpperCase();
+
+    if (is_blocked(ssid) || is_blocked(mac_str)){
+      out = "";
+      ESP_LOGV(LOG_TAG_GENERIC, "Blocked WiFi entry (from B): %s / %s", ssid.c_str(), mac_str.c_str());
+      wifi_block_at = millis();
+      return out;
+    }
+
+    unsigned char mac_bytes[6];
+    int values[6];
+
+    if (6 == sscanf(mac_str.c_str(), "%x:%x:%x:%x:%x:%x%*c", &values[0], &values[1], &values[2], &values[3], &values[4], &values[5])){
+      for(int i = 0; i < 6; ++i ){
+          mac_bytes[i] = (unsigned char) values[i];
+      }
+    
+      if (!seen_mac(mac_bytes)){
+        save_mac(mac_bytes);
+        total_new_wifi++;
+
+        String authtype = security_int_to_string((int) security_raw.toInt());
+        
+        out = mac_str + "," + ssid + "," + authtype + "," + dt_string(get_epoch()) + "," + channel + "," + rssi + "," + gps_string() + ",WIFI";
+      }
+    }
+    
+    b_working = true;
+  }
+
+  if (buff.indexOf("GSM,") > -1) {
+    //GSM,Operator:"vodafone",MCC:000,MNC:00,Rxlev:12,Cellid:FF00,Arfcn:4,Lac:0000,Bsic:00
+    //^Some values censored for my privacy^ :)
+
+    gsm_count++;
+    
+    int startpos = buff.indexOf("Operator:\"")+10;
+    int endpos = buff.indexOf("\"",startpos);
+    String cell_operator = buff.substring(startpos,endpos);
+
+    startpos = buff.indexOf("MCC:")+4;
+    endpos = buff.indexOf(",",startpos);
+    String mcc = buff.substring(startpos,endpos);
+
+    startpos = buff.indexOf("MNC:")+4;
+    endpos = buff.indexOf(",",startpos);
+    String mnc = buff.substring(startpos,endpos);
+
+    startpos = buff.indexOf("Rxlev:")+6;
+    endpos = buff.indexOf(",",startpos);
+    String rxlev = buff.substring(startpos,endpos);
+
+    startpos = buff.indexOf("Cellid:")+7;
+    endpos = buff.indexOf(",",startpos);
+    String cellid = buff.substring(startpos,endpos);
+
+    startpos = buff.indexOf("Arfcn:")+6;
+    endpos = buff.indexOf(",",startpos);
+    String arfcn = buff.substring(startpos,endpos);
+
+    startpos = buff.indexOf("Lac:")+4;
+    endpos = buff.indexOf(",",startpos);
+    String lac = buff.substring(startpos,endpos);
+
+    startpos = buff.indexOf("Bsic:")+5;
+    endpos = buff.length()-1;
+    String bsic = buff.substring(startpos,endpos);
+
+    int lac_int;
+    int cellid_int;
+    int rssi_int;
+    int arfcn_int;
+
+    lac_int = (int) strtol(lac.c_str(), 0, 16);
+    cellid_int = (int) strtol(cellid.c_str(), 0, 16);
+    rssi_int = (int) rxlev.toInt();
+    rssi_int = rssi_int - 80;
+    arfcn_int = (int) arfcn.toInt();
+
+    String mccmnc = mcc + mnc;
+    String wigle_cell_key = mccmnc.substring(0,7);
+    wigle_cell_key += "_";
+    wigle_cell_key += lac_int;
+    wigle_cell_key += "_";
+    wigle_cell_key += cellid_int;
+
+    struct coordinates cell_pos;
+    cell_pos = (coordinates){.lat = 0, .lon = 0, .acc = -255};
+
+    struct cell_tower tower;
+    tower = (cell_tower){.mcc = (int) mcc.toInt(), .mnc = (int) mnc.toInt(), .lac = (int) lac.toInt(), .cellid = cellid_int, .seenat = millis(), .strength = rssi_int, .pos = cell_pos};
+    
+    if (!seen_cell(tower)){
+      //Get the location for this newly-seen tower if the GPS is almost stale.
+      if (millis() > lastgps + gps_allow_stale_time/2 || lastgps == 0){
+        cell_pos = get_cell_pos(wigle_cell_key);
+        tower.pos = cell_pos;
+      }
+      
+      out = wigle_cell_key + "," + cell_operator + ",GSM;" + mccmnc + "," + dt_string(get_epoch()) + "," + arfcn + "," + rssi_int + "," + gps_string() + ",GSM";
+      save_cell(tower);
+    } else {
+      //We've seen this tower, get the full object so we can see if anything is missing
+      struct cell_tower ram_tower = get_tower(tower);
+      if (ram_tower.pos.acc == -255){
+        //We've never tried to get the location of this tower. Consider doing that now.
+        if (millis() > lastgps + gps_allow_stale_time/2 || lastgps == 0){
+          //Get the position for this tower and replace what is currently in RAM.
+          cell_pos = get_cell_pos(wigle_cell_key);
+          tower.pos = cell_pos;
+          replace_cell(ram_tower, tower);
+        }
+      }
+    }
+  }
+
+  if (buff.indexOf("TEMP,") > -1) {
+    int startpos = buff.indexOf("TEMP,")+5;
+    String temp = buff.substring(startpos);
+    temperature = temp.toFloat();
+    ESP_LOGV(LOG_TAG_GENERIC, "Got temperature: %s / %f", buff.c_str(), temperature);
+  }
+
+  if (buff.indexOf("BLC,") > -1) {
+    int startpos = buff.indexOf("BLC,")+4;
+    String blc = buff.substring(startpos);
+    ble_count = blc.toInt();
+    ESP_LOGV(LOG_TAG_GENERIC, "Got BLE count: %s / %i", buff.c_str(), ble_count);
+    b_working = true;
+    verified_working_pcb_baud_rate = pcb_baud_rate;
+  }
+
+  if (buff.indexOf("5G,") > -1) {
+    int startpos = buff.indexOf("5G,")+3;
+    String count_5ghz_str = buff.substring(startpos);
+    count_5ghz = count_5ghz_str.toInt();
+    ESP_LOGV(LOG_TAG_GENERIC, "Got 5GHz WiFi count: %s / %i", buff.c_str(), count_5ghz);
+    b_working = true;
+    verified_working_pcb_baud_rate = pcb_baud_rate;
+    is_5ghz = true;
+  }
+  
+  return out;
+}
+
+String dt_string_from_gps(){
+  //Return a datetime String using GPS data only.
+  String datetime = "";
+  if (nmea.getYear() > 0){
+    datetime += nmea.getYear();
+    datetime += "-";
+    datetime += nmea.getMonth();
+    datetime += "-";
+    datetime += nmea.getDay();
+    datetime += " ";
+    datetime += nmea.getHour();
+    datetime += ":";
+    datetime += nmea.getMinute();
+    datetime += ":";
+    datetime += nmea.getSecond();
+  }
+  return datetime;
+}
+
+String gps_string(){
+  //Return a String which can be used in a Wigle CSV line to show the current position.
+  //This uses data from GPS and GSM tower locations.
+  //output: lat,lon,alt,acc
+  String out = "";
+  long alt = 0;
+  if (!nmea.getAltitude(alt)){
+    alt = 0;
+  }
+  float altf = (float)alt / 1000;
+
+  String lats = String((float)nmea.getLatitude()/1000000, 7);
+  String lons = String((float)nmea.getLongitude()/1000000, 7);
+  if (nmea.isValid() && nmea.getHDOP() <= 250){
+    last_lats = lats;
+    last_lons = lons;
+  }
+
+  //HDOP returned here is in tenths and needs dividing by 10 to make it 'true'.
+  //We're using this as a very basic estimate of accuracy by multiplying HDOP with the precision of the GPS module (2.5)
+  //This isn't precise at all, but is a very rough estimate to your GPS accuracy.
+  float accuracy = ((float)nmea.getHDOP()/10);
+  accuracy = accuracy * 2.5;
+
+  if (nmea.getHDOP() > 250){
+    lats = "";
+    lons = "";
+    accuracy = 1000;
+  }
+
+  if (!nmea.isValid()){
+    lats = "";
+    lons = "";
+    accuracy = 1000;
+    if (lastgps + gps_allow_stale_time > millis()){
+      lats = last_lats;
+      lons = last_lons;
+      if (lats != "" && lons != ""){
+        accuracy = 5 + (millis() - lastgps) / 100;
+      }
+    } else {
+      ESP_LOGD(LOG_TAG_GENERIC, "Bad GPS, will use GSM positioning");
+      struct coordinates pos = gsm_get_current_position();
+      if (pos.acc > 0){
+        lats = String(pos.lat, 6);
+        lons = String(pos.lon, 6);
+        accuracy = pos.acc;
+      }
+    }
+  }
+
+  //The module we are using has a precision of 2.5m, accuracy can never be better than that.
+  if (accuracy <= 2.5){
+    accuracy = 2.5;
+  }
+
+  if (force_lat != 0 && force_lon != 0){
+    lats = String(force_lat, 6);
+    lons = String(force_lon, 6);
+    accuracy = 1;
+    ESP_LOGV(LOG_TAG_GENERIC, "Forced Lat/Lon to: %f,%f", force_lat, force_lon);
+  }
+
+  if (lats == "" && lons == ""){
+    out = ",,,";
+  } else {
+    out = lats + "," + lons + "," + altf + "," + accuracy;
+  }
+  return out;
+}
+
+String security_int_to_string(int security_type){
+  //Provide a security type int from WiFi.encryptionType(i) to convert it to a String which Wigle CSV expects.
+  String authtype = "";
+  switch (security_type){
+    case WIFI_AUTH_OPEN:
+      authtype = "[OPEN]";
+      break;
+  
+    case WIFI_AUTH_WEP:
+      authtype = "[WEP]";
+      break;
+  
+    case WIFI_AUTH_WPA_PSK:
+      authtype = "[WPA_PSK]";
+      break;
+  
+    case WIFI_AUTH_WPA2_PSK:
+      authtype = "[WPA2_PSK]";
+      break;
+  
+    case WIFI_AUTH_WPA_WPA2_PSK:
+      authtype = "[WPA_WPA2_PSK]";
+      break;
+  
+    case WIFI_AUTH_WPA2_ENTERPRISE:
+      authtype = "[WPA2]";
+      break;
+
+    //Requires at least v2.0.0 of https://github.com/espressif/arduino-esp32/
+    case WIFI_AUTH_WPA3_PSK:
+      authtype = "[WPA3_PSK]";
+      break;
+
+    case WIFI_AUTH_WPA2_WPA3_PSK:
+      authtype = "[WPA2_WPA3_PSK]";
+      break;
+
+    case WIFI_AUTH_WAPI_PSK:
+      authtype = "[WAPI_PSK]";
+      break;
+        
+    default:
+      authtype = "[UNDEFINED]";
+  }
+
+  return authtype;
+}
+
+String get_latest_datetime(String filename, boolean date_only){
+  //Provide a filename to get the highest datetime from that Wigle CSV file on the SD card.
+  String buff = "";
+  
+  File reader = SD.open(filename, FILE_READ);
+  time_t meta_lastwrite = reader.getLastWrite();
+  String dt = "";
+  if (meta_lastwrite > YEAR_2020){
+    dt = dt_string(meta_lastwrite);
+    ESP_LOGD(LOG_TAG_GENERIC, "get_latest_datetime, NEW method for file %s = %s", filename.c_str(), dt.c_str());
+  } else {
+    int seekto = reader.size()-512;
+    if (seekto < 1){
+      seekto = 0;
+    }
+    reader.seek(seekto);
+    int ccount = 0;
+    while (reader.available()){
+      char c = reader.read();
+      if (c == '\n' || c == '\r'){
+        if (ccount == 10){
+          int startpos = buff.indexOf("],2");
+          int endpos = buff.indexOf(",",startpos+3);
+          if (startpos > 0 && endpos > 0){
+            dt = buff.substring(startpos+2,endpos);
+            ESP_LOGD(LOG_TAG_GENERIC, "get_latest_datetime, OLD method for file %s = %s", filename.c_str(), dt.c_str());
+            break;
+          } 
+        }
+        ccount = 0;
+        buff = "";
+      } else {
+        buff.concat(c);
+        if (c == ','){
+          ccount++;
+        }
+      }
+    }
+  }
+  reader.close();
+  if (date_only){
+    int spacepos = dt.indexOf(" ");
+    String new_dt = dt.substring(0,spacepos);
+    dt = new_dt;
+    ESP_LOGV(LOG_TAG_GENERIC, "get_latest_datetime, date_only stripped to %s for %s", dt, filename);
+  }
+  return dt;
+}
+
+boolean set_sys_clock(unsigned long new_epoch){
+  //Wrapper function to set sys clock to epoch value using standard POSIX functions
+
+  struct timeval val;
+  int ret;
+
+  val.tv_sec = new_epoch;
+  val.tv_usec = 0;
+  ret = settimeofday(&val, NULL);
+
+  if (ret == 0){
+    return true;
+  } else {
+    return false;
+  }
+}
+
+void gps_time_sync(){
+  //Sync the time with GPS data if available.
+
+  String gps_dt = dt_string_from_gps();
+  if (gps_dt.length() < 5){
+    return;
+  }
+
+  struct tm tm;
+  unsigned long this_epoch = 0;
+
+  strptime(gps_dt.c_str(), "%Y-%m-%d %H:%M:%S", &tm );
+  this_epoch = (unsigned long)mktime(&tm);
+
+  if (this_epoch < YEAR_2020){
+    return;
+  }
+
+  set_sys_clock(this_epoch);
+}
+
+struct coordinates get_cell_pos(String wigle_key){
+  //Convert a GSM wigle_key to a coordinates struct using CSV files stored at cells/ on the SD card.
+  //This location should be the approximate location of the cell tower.
+  struct coordinates toreturn;
+  toreturn = (coordinates){.lat = 0, .lon = 0, .acc = -127};
+
+  ESP_LOGD(LOG_TAG_GENERIC, "Cell Tower lookup for %s", wigle_key.c_str());
+  int endpos = wigle_key.indexOf("_");
+  String mccmnc = wigle_key.substring(0,endpos);
+  
+  int startpos = endpos+1;
+  endpos = wigle_key.indexOf("_", startpos);
+  String lac = wigle_key.substring(startpos,endpos);
+  ESP_LOGV(LOG_TAG_GENERIC, "Cell Tower lookup LAC is %s", lac.c_str());
+
+  String mccmnclac = mccmnc + "_" + lac;
+
+  File filereader = SD.open("/cells/" + mccmnc + ".csv", FILE_READ);
+  if (!filereader){
+    ESP_LOGD(LOG_TAG_GENERIC, "Cell Tower lookup file not found for %s", mccmnc.c_str());
+    return toreturn;
+  }
+
+  boolean index_read = false;
+  boolean in_position = false;
+  int lines = 0;
+  String buff = "";
+  while (filereader.available()){
+    char c = filereader.read();
+    if (c != '\n'){
+      buff.concat(c);
+    } else {
+      if (buff.length() < 17){
+        //Index lines are the only lines which are under 17 chars in these files
+        if (buff.indexOf(lac + ",") == 0){
+          ESP_LOGV(LOG_TAG_GENERIC, "Index found for LAC %s, buff = %s", lac.c_str(), buff.c_str());
+          //This index entry is what we need.
+          startpos = buff.indexOf(",")+1;
+          String offset_str = buff.substring(startpos);
+          int offset = offset_str.toInt()-64;
+          if (offset > filereader.position()){
+            ESP_LOGV(LOG_TAG_GENERIC, "Index jump to pos %i", offset);
+            filereader.seek(offset);
+            lines = 0;
+            buff = "";
+            index_read = true;
+            continue;
+          }
+        }
+      }
+      if (buff.indexOf(wigle_key) > -1){
+        ESP_LOGV(LOG_TAG_GENERIC, "Tower lookup, wigle key (%s) found, buff = %s", wigle_key.c_str(), buff.c_str());
+
+        startpos = buff.indexOf(",")+1;
+        endpos = buff.indexOf(",",startpos);
+        String lat_str = buff.substring(startpos,endpos);
+
+        startpos = endpos+1;
+        endpos = buff.indexOf(",",startpos);
+        String lon_str = buff.substring(startpos,endpos);
+
+        startpos = endpos+1;
+        String acc_str = buff.substring(startpos);
+
+        double lat = lat_str.toDouble();
+        double lon = lon_str.toDouble();
+        int acc = acc_str.toInt();
+
+        toreturn.lat = lat;
+        toreturn.lon = lon;
+        toreturn.acc = acc;
+        
+        break;
+      } else {
+        if (in_position == false){
+          if (buff.indexOf(mccmnclac) > -1){
+            in_position = true;
+            ESP_LOGV(LOG_TAG_GENERIC, "Now in position at %i, lines = %i", filereader.position(), lines);
+          }
+        }
+        if (buff.indexOf(mccmnclac) < 0 && index_read == true && in_position == true){
+          ESP_LOGD(LOG_TAG_GENERIC, "Reading the wrong section, stopping. Buff = %s", buff.c_str());
+          break;
+        }
+      }
+      lines++;
+      buff = "";
+      if (lines >= 5000){
+        ESP_LOGD(LOG_TAG_GENERIC, "Giving up - read too many lines");
+        break;
+      }
+    }
+  }
+  ESP_LOGD(LOG_TAG_GENERIC, "Done. Read %i lines.", lines);
+  filereader.close();
+  return toreturn;
+}
+
+struct coordinates gsm_get_current_position(){
+  //Get our current position using recently seen cell towers.
+
+  struct coordinates toreturn = (coordinates){.lat = 0, .lon = 0, .acc = -255};
+   
+  double lat_total = 0;
+  double lon_total = 0;
+  unsigned int total = 0;
+
+  int max_accuracy = -127;
+  
+  for (int x = 0; x < cell_history_len; x++){
+    struct cell_tower tower = cell_history[x];
+    if (tower.pos.acc < 1){
+      continue;
+    }
+    if (tower.pos.lat == 0 && tower.pos.lon == 0){
+      continue;
+    }
+    if (tower.seenat+20000 < millis()){
+      continue;
+    }
+    
+    //This is a (negative) RSSI value, make it positive where high numbers are stronger signals.
+    int strength = (tower.strength + 100);
+
+    if (tower.pos.acc > max_accuracy){
+      max_accuracy = tower.pos.acc;
+    }
+    
+    if (strength < 1){
+      strength = 1;
+    }
+    ESP_LOGV(LOG_TAG_GENERIC, "Using tower %i with strength %i", tower.cellid, tower.strength);
+    for (int y = 0; y <= strength; y++){
+      lat_total += tower.pos.lat;
+      lon_total += tower.pos.lon;
+      total++;
+    }
+  }
+
+  double lat = lat_total / total;
+  double lon = lon_total / total;
+
+  if (max_accuracy > 0){
+    toreturn.lat = lat;
+    toreturn.lon = lon;
+    toreturn.acc = max_accuracy;
+    ESP_LOGD(LOG_TAG_GENERIC, "Got location from %i towers: %i,%i with accuracy %i", total,lat,lon,max_accuracy);
+  }
+
+  return toreturn;
+}
+
+String device_type_string(){
+  String ret = "";
+  switch (DEVICE_TYPE){
+    case DEVICE_REV3:
+      ret = "rev3";
+      break;
+      
+    case DEVICE_REV3_5:
+      ret = "rev3 5GHz";
+      break;
+
+    case DEVICE_REV3_5GM:
+      ret = "rev3 5GHz (mod)";
+      break;
+
+    case DEVICE_REV4:
+      ret = "rev4";
+      break;
+
+    case DEVICE_CUSTOM:
+      ret = "generic";
+      break;
+
+    case DEVICE_CSF_MINI:
+      ret = "Mini Wardriver Rev2";
+      break;
+
+    default:
+      ret = "generic";
+      break;
+  }
+  
+  return ret;
+}
+
+String device_brand_string(){
+  String ret = "JHewitt";
+  switch (DEVICE_TYPE){
+    case DEVICE_CSF_MINI:
+      ret = "CoD_Segfault";
+      break;
+
+    default:
+      ret = "JHewitt";
+      break;
+  }
+
+  return ret;
+}
+
+String device_string(){
+  // Used for the "device" parameter in WiGLE CSV headers.
+  String ret = "";
+  switch (DEVICE_TYPE){
+    case DEVICE_CSF_MINI:
+      ret = "tim";
+      break;
+
+    default:
+      ret = "wardriver.uk " + device_type_string();
+      break;
+  }
+  
+  return ret;
+}
+
+String device_board_string(){
+  // Used for the "board" parameter in WiGLE CSV headers.
+  String ret = "";
+  switch (DEVICE_TYPE){
+    case DEVICE_CSF_MINI:
+      ret = "tim";
+      break;
+
+    default:
+      ret = "wardriver.uk " + device_type_string();
+      break;
+  }
+  
+  return ret;
+}
+
+byte identify_model(){
+  //Block until we know for sure what hardware model this is. Can take a while so cache the response.
+  //Return a byte indicating the model, such as DEVICE_REV3.
+  //Only call *before* the main loops start, otherwise multiple threads could be trying to access the serial.
+
+  //Start by reading board/PCB identifier pins, since this responds immediately.
+  byte board_id = read_id_pins();
+  switch(board_id){
+    case 1:
+      DEVICE_TYPE = DEVICE_CSF_MINI; // CoD_Segfault Mini Wardriver Rev2
+      return DEVICE_TYPE;
+    default:                         // No board ID, continue with identification
+      break;
+  }
+
+
+  if (is_5ghz && DEVICE_TYPE == DEVICE_REV3){
+    //We already determined we're REV3, but now we have 5Ghz. Must be modded.
+    DEVICE_TYPE = DEVICE_REV3_5GM;
+  }
+
+  if (DEVICE_TYPE != DEVICE_UNKNOWN){
+    //We already know.
+    ESP_LOGD(LOG_TAG_GENERIC, "Already identified the device, returning now");
+    return DEVICE_TYPE;
+  }
+  
+  ESP_LOGD(LOG_TAG_GENERIC, "Running hardware identification");
+  
+  //TODO: For models without "side B" serial, detect their respective bus here and do an immediate return.
+
+  //For anything which is rev 3-ish, listen to the "side B" serial for a while.
+  //Timeout after a while in case "side B" is dead/missing, it's technically optional.
+  int i = 0;
+  String buff = "";
+  int bufflen = 0;
+  while (i < 10000){
+    if (Serial1.available()){
+      char c = Serial1.read();
+      if (c == '\n' || c == '\r'){
+        //Handle buff.
+        if (buff.indexOf("BLC,") > -1){
+          ESP_LOGD(LOG_TAG_GENERIC, "Device is Rev3 (cm)");
+          return DEVICE_REV3;
+        }
+        if (buff.indexOf("REV3!") > -1){
+          ESP_LOGD(LOG_TAG_GENERIC, "Device is Rev3");
+          return DEVICE_REV3;
+        }
+        if (buff.indexOf("!REV3.5") > -1){
+          ESP_LOGD(LOG_TAG_GENERIC, "Device is Rev3 5Ghz");
+          return DEVICE_REV3_5;
+        }
+
+        buff = "";
+      }
+      buff.concat(c);
+      bufflen++;
+      if (bufflen > 70){
+        bufflen = 0;
+        buff = "";
+      }
+      
+    }
+    delay(1);
+    i++;
+  }
+  ESP_LOGW(LOG_TAG_GENERIC, "Failed to identify device model");
+  return DEVICE_UNKNOWN;
+}
+
+String get_config_option(String key){
+  #define max_line_len 64
+  
+  char linebuf[max_line_len];
+  File filereader = SD.open("/cfg.txt", FILE_READ);
+  if (!filereader){
+    ESP_LOGD(LOG_TAG_GENERIC, "Could not open cfg.txt");
+    return "";
+  }
+
+  //Unlikely to be needed but a nice safety net.
+  filereader.setTimeout(500);
+
+  while (filereader.available()){
+    int buflen = filereader.readBytesUntil('\n', linebuf, max_line_len-1);
+    if (buflen < 1){
+      ESP_LOGD(LOG_TAG_GENERIC, "Failed to read line, buflen = %i", buflen);
+      continue;
+    }
+    
+    String cfgkey = "";
+    String value = "";
+    bool reading_key = true;
+    
+    for (int i = 0; i < buflen; i++){
+      if (linebuf[i] == '='){
+        reading_key = false;
+        continue;
+      }
+      if (linebuf[i] == '\n' || linebuf[i] == '\r'){
+        break;
+      }
+      if (reading_key){
+        cfgkey.concat(linebuf[i]);
+      } else {
+        value.concat(linebuf[i]);
+      }
+    }
+    ESP_LOGV(LOG_TAG_GENERIC, "Config read: %s = %s", cfgkey.c_str(), value.c_str());
+
+    if (cfgkey == key){
+      ESP_LOGV(LOG_TAG_GENERIC, "Config key match: %s", cfgkey.c_str());
+
+      filereader.close();
+      return value;
+    }
+    
+  }
+  
+  ESP_LOGD(LOG_TAG_GENERIC, "Did not find config %s", key.c_str());
+  filereader.close();
+  
+  return "";
+  
+}
+
+String generate_filename(String filepath){
+  //Actual filenames on the SD card are kept short due to FAT32 restrictions, this function gives us a nicer name.
+  String fname = "";
+  fname.concat(get_latest_datetime(filepath, true));
+  fname.concat("_");
+  fname.concat(chip_id);
+  fname.concat("_");
+  fname.concat(filepath);
+  fname.replace("/","_");
+  return fname;
+}
+
+String generate_user_agent(){
+  String ret = "wardriver.uk - ";
+  ret.concat(device_type_string());
+  ret.concat(" / ");
+  ret.concat(VERSION);
+  if (!BUILD.startsWith("[")){
+    ret.concat(" - ");
+    ret.concat(BUILD);
+  }
+  return ret;
+}
+
+void setup_id_pins(){
+  //The following pins are used for board identification
+  pinMode(13, INPUT_PULLDOWN); // IO13 is A/B identifier pin
+  pinMode(25, INPUT_PULLDOWN); // All other pins are board identifers
+  pinMode(26, INPUT_PULLDOWN);
+  pinMode(32, INPUT_PULLDOWN);
+  pinMode(33, INPUT_PULLDOWN);
+}
+
+byte read_id_pins(){
+  //Read a byte denoting the board ID, used for device identification
+  byte board_id = 0;
+  board_id = digitalRead(25);                     // shift bits to get a board ID
+  board_id = (board_id << 1) + digitalRead(26);
+  board_id = (board_id << 1) + digitalRead(32);
+  board_id = (board_id << 1) + digitalRead(33);
+
+  ESP_LOGV(LOG_TAG_GENERIC, "Board ID = %u", board_id);
+  return board_id;
+}
+

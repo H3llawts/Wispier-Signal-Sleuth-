@@ -1,0 +1,40 @@
+name: Compile ESP32 firmware
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [A, B]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+        with:
+          version: "1.2.2"
+      - name: Install pinned dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          board_url=https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index --additional-urls "$board_url"
+          while IFS= read -r dependency; do
+            arduino-cli core install "$dependency" --additional-urls "$board_url"
+          done < boards.txt
+          while IFS= read -r dependency; do
+            arduino-cli lib install "$dependency"
+          done < libraries.txt
+      - name: Compile
+        run: arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs,FlashMode=dio,FlashFreq=80,FlashSize=4M,DebugLevel=info --output-dir build/${{ matrix.side }} ${{ matrix.side }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: experimental-esp32-${{ matrix.side }}
+          path: build/${{ matrix.side }}/
+          if-no-files-found: error
+

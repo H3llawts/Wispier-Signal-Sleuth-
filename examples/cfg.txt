@@ -1,0 +1,5 @@
+sb_bw16=yes
+scanble=yes
+tempunits_c=no
+gps_baud_rate=9600
+
