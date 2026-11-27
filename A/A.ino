@@ -1,7 +1,7 @@
 //Joseph Hewitt 2023
 //This code is for the ESP32 "Side A" of the wardriver hardware revision 3.
 
-const String VERSION = "wispier-0.1.0-dev";
+const String VERSION = "wispier-0.2.0-dev";
 
 #include <GParser.h>
 #include <MicroNMEA.h>
@@ -16,6 +16,7 @@ const String VERSION = "wispier-0.1.0-dev";
 #include "mbedtls/md.h"
 #include <WiFiClientSecure.h>
 #include <nvs_flash.h>
+#include "SessionUpload.h"
 
 //Logging library and log tags:
 #include "esp_log.h"
@@ -316,34 +317,25 @@ void wigle_load_history(){
     return;
   }
 
-  if (wigle_api_key.length() < 3){
+  const String credential = session_upload::wigleCredential(wigle_api_key);
+  if (!session_upload::headerValue(credential)){
     ESP_LOGD(LOG_TAG_GENERIC, "Not authorized with WiGLE");
     return;
   }
 
-  //This block is duplicated also in wigle_upload, refactor some time?
-  //Current root is 1940, double it in case larger certs are used in the future.
-  #define ca_len 3880
-  byte ca_root[ca_len] = {}; // PEM must remain NUL-terminated.
-  ESP_LOGV(LOG_TAG_GENERIC, "Load WiGLE CA");
-  File careader = SD.open("/wigle.crt", FILE_READ);
-  if (careader.size() > ca_len-2){
-    ESP_LOGW(LOG_TAG_GENERIC, "WiGLE CA too large");
-    return;
-  }
-  careader.read(ca_root, ca_len);
-  careader.close();
-  //^
-  
+  String ca_root = session_upload::readCardValue("/wigle.crt", 8192);
+  if (!ca_root.startsWith("-----BEGIN CERTIFICATE-----")) return;
+
   clear_display();
   display.println("Contacting WiGLE");
   display.display();
 
 
   WiFiClientSecure httpsclient;
-  httpsclient.setCACert((char*)ca_root);
+  httpsclient.setCACert(ca_root.c_str());
 
-  if (!httpsclient.connect("api.wigle.net", 443)){
+  httpsclient.setTimeout(4000);
+  if (!httpsclient.connect("api.wigle.net", 443, 8000)){
     ESP_LOGW(LOG_TAG_GENERIC, "WiGLE connection failed");
     return;
   }
@@ -357,12 +349,13 @@ void wigle_load_history(){
   httpsclient.print("User-Agent: ");
   httpsclient.println(generate_user_agent());
   httpsclient.print("Authorization: Basic ");
-  httpsclient.println(wigle_api_key);
+  httpsclient.println(credential);
   httpsclient.println();
 
   boolean headers = true;
   String lbuf = "";
-  while (httpsclient.connected()){
+  unsigned long historyStarted = millis();
+  while (httpsclient.connected() && millis() - historyStarted < 12000){
     if (headers){
       lbuf = httpsclient.readStringUntil('\n');
       if (lbuf.length() < 3){
@@ -425,169 +418,14 @@ void wigle_load_history(){
 }
 
 boolean wigle_upload(String path){
+  if (!session_upload::isSession(path)) return false;
   clear_display();
   display.println("WiGLE Upload");
   display.display();
-  if (!SD.exists(path)){
-    ESP_LOGD(LOG_TAG_GENERIC, "Wigle upload filepath not found: %s", path.c_str());
-    return false;
-  }
-
-  if (!SD.exists("/wigle.crt")){
-    ESP_LOGW(LOG_TAG_GENERIC, "No WiGLE CA cert file!");
-    return false;
-  }
-  
-  //Current root is 1940, double it in case larger certs are used in the future.
-  #define ca_len 3880
-  byte ca_root[ca_len] = {}; // PEM must remain NUL-terminated.
-  ESP_LOGV(LOG_TAG_GENERIC, "Load WiGLE CA");
-  File careader = SD.open("/wigle.crt", FILE_READ);
-  if (careader.size() > ca_len-2){
-    ESP_LOGW(LOG_TAG_GENERIC, "WiGLE CA too large");
-    return false;
-  }
-  careader.read(ca_root, ca_len);
-  careader.close();
-
-  String boundary = "wduk";
-  boundary.concat(esp_random());
-  
-  WiFiClientSecure httpsclient;
-  httpsclient.setCACert((char*)ca_root);
-
-  if (!httpsclient.connect("api.wigle.net", 443)){
-    ESP_LOGW(LOG_TAG_GENERIC, "WiGLE connection failed");
-    return false;
-  }
-  ESP_LOGD(LOG_TAG_GENERIC, "WiGLE connection opened");
-  display.println("Connected");
-  display.display();
-  
-  File filereader = SD.open(path);
-
-  ESP_LOGD(LOG_TAG_GENERIC, "Starting upload to WiGLE");
-
-  String nice_filename = generate_filename(path);
-
-  //This is horrible :^)
-  //Content-Disposition headers appear in the HTTP body, this is the calculated size.
-  int cd_header_len = 0;
-  cd_header_len += (boundary.length()+2)*3; //We use the boundary 3 times, double-dashed (the +2)
-  cd_header_len += 2; //The additional double-dash for the final boundary.
-  cd_header_len += 56; //Initial content-disposition filename line, including closing quote
-  cd_header_len += nice_filename.length();
-  cd_header_len += 22; //Content-Type CSV
-  cd_header_len += 45; //Second content-disposition line for "donate" form.
-  if (wigle_commercial){
-    ESP_LOGV(LOG_TAG_GENERIC, "WiGLE commercial optin selected");
-    cd_header_len += 4; //"on" + \n\r
-  }
-  cd_header_len += 22; //New lines (doubled, because it's CR&LF)
-  ESP_LOGV(LOG_TAG_GENERIC, "WiGLE upload cd_header_len = %i", cd_header_len);
-  
-  httpsclient.println("POST /api/v2/file/upload HTTP/1.0");
-  httpsclient.println("Host: api.wigle.net");
-  httpsclient.println("Connection: close");
-  httpsclient.print("User-Agent: ");
-  httpsclient.println(generate_user_agent());
-  if (wigle_api_key.length() > 2){
-    httpsclient.print("Authorization: Basic ");
-    httpsclient.println(wigle_api_key);
-  }
-  httpsclient.print("Content-Type: multipart/form-data; boundary=");
-  httpsclient.println(boundary);
-  httpsclient.print("Content-Length: ");
-  httpsclient.println(filereader.size()+cd_header_len);
-  
-  boundary = "--" + boundary;
-  //End header:
-  httpsclient.println();
-  //Start content-disposition file header:
-  httpsclient.println(boundary);
-  httpsclient.print("Content-Disposition: form-data; name=\"file\"; filename=\"");
-  httpsclient.print(nice_filename);
-  httpsclient.println("\"");
-  httpsclient.println("Content-Type: text/csv");
-  //End content-disposition file header:
-  httpsclient.println();
-  //Start file body:
-
-  #define CBUFLEN 1024
-  byte cbuf[CBUFLEN];
-  
-  float percent = 0;
-  float filesize = (float)filereader.size();
-  int i = 0;
-  while (filereader.available()){
-    int bytes_read = filereader.read(cbuf, CBUFLEN);
-    if (bytes_read > 0){
-      httpsclient.write(cbuf, bytes_read);
-      ESP_LOGV(LOG_TAG_GENERIC, "Read and sent %i bytes", bytes_read);
-    } else {
-      ESP_LOGW(LOG_TAG_GENERIC, "file read returned %i during WiGLE upload", bytes_read);
-      break;
-    }
-
-    if (i > 40 || i == 0){
-      i = 0;
-      clear_display();
-      display.println("WiGLE Upload");
-      percent = ((float)filereader.position() / filesize) * 100;
-      display.print(percent);
-      display.println("%");
-      display.display();
-    }
-    i++;
-  }
-
-  //httpsclient.write(filereader);
-  //End file body:
-  httpsclient.println();
-  httpsclient.println();
-  //Start content-disposition form header:
-  httpsclient.println(boundary);
-  httpsclient.println("Content-Disposition: form-data; name=\"donate\"");
-  //End content-disposition form header:
-  httpsclient.println();
-  //Start form body:
-  if (wigle_commercial){
-    httpsclient.println("on");
-  }
-  //End content-disposition:
-  httpsclient.print(boundary);
-  httpsclient.println("--");
-  httpsclient.println();
-  httpsclient.flush();
-
-  ESP_LOGD(LOG_TAG_GENERIC, "Upload complete");
-  clear_display();
-  display.println("Transfer complete");
-  display.display();
-
-  String serverres = "";
-
-  while (httpsclient.connected()){
-    if (httpsclient.available()){
-      char c = httpsclient.read();
-      serverres.concat(c);
-    }
-    if (serverres.length() > 1024){
-      ESP_LOGW(LOG_TAG_GENERIC, "Abort WiGLE read; payload too large");
-      break;
-    }
-  }
-  ESP_LOGV(LOG_TAG_GENERIC, "serverres = %s", serverres.c_str());
-
-  httpsclient.stop();
-  ESP_LOGD(LOG_TAG_GENERIC, "WiGLE connection closed");
-
-  if (serverres.indexOf("\"success\":true") > -1){
-    ESP_LOGD(LOG_TAG_GENERIC, "WiGLE upload success confirmed");
-    return true;
-  }
-  ESP_LOGD(LOG_TAG_GENERIC, "WiGLE upload was not confirmed");
-  return false;
+  String result = session_upload::upload(path, session_upload::WIGLE, generate_filename(path),
+                                         wigle_api_key, wigle_commercial);
+  ESP_LOGI(LOG_TAG_GENERIC, "%s", result.c_str());
+  return result == "Accepted by WiGLE for processing";
 }
 
 String ota_get_url(String url, String write_to=""){
@@ -1218,7 +1056,7 @@ void wigle_upload_all(){
         filename = "/";
         filename.concat(entry.name());
       }
-      if (!filename.endsWith(".csv")){
+      if (!session_upload::isSession(filename)){
         ESP_LOGV(LOG_TAG_GENERIC, "%s is not CSV", filename.c_str());
         continue;
       }
@@ -1630,11 +1468,6 @@ void boot_config(){
         String ota_test = ota_get_url("/");
         ESP_LOGV(LOG_TAG_GENERIC, "OTA test, page root = %s", ota_test.c_str());
 
-        //Implement a hash check, only run if there's a mismatch.
-        ESP_LOGD(LOG_TAG_GENERIC, "Will download wigle.crt");
-        SD.remove("/wigle.crt");
-        ota_get_url("/wigle.crt", "/wigle.crt");
-
         wigle_load_history();
         if (wigle_autoupload){
           wigle_upload_all();
@@ -1649,6 +1482,7 @@ void boot_config(){
       boolean newline = false;
       WiFiServer server(80);
       server.begin();
+      const String uploadNonce = String(esp_random(), HEX) + "-" + String(esp_random(), HEX);
       while (WiFi.status() == WL_CONNECTED || created_network == true){
         clear_display();
         if (created_network){
@@ -1702,7 +1536,7 @@ void boot_config(){
               buff += c;
               if (c == '\n'){
                 if (newline){
-                  ESP_LOGV(LOG_TAG_GENERIC, "End of client request: %s", buff.c_str());
+                  ESP_LOGV(LOG_TAG_GENERIC, "End of client request");
                   client.println("HTTP/1.1 200 OK");
                   client.println("Connection: close");
                   
@@ -1742,7 +1576,7 @@ void boot_config(){
 
                     client.println("</p>");
                     
-                    client.println("<table><tr><th>File</th><th>Size</th><th>Status</th><th>Opt</th></tr>");
+                    client.println("<table><tr><th>File</th><th>Size</th><th>WiGLE status</th><th>Options</th></tr>");
                     ESP_LOGD(LOG_TAG_GENERIC, "Scanning for files");
                     File dir = SD.open("/");
                     while (true) {
@@ -1756,6 +1590,9 @@ void boot_config(){
                           filename = "/";
                           filename.concat(entry.name());
                         }
+
+                        if (filename == session_upload::stagingPath || filename.endsWith("_key.txt") ||
+                            filename == "/wigle_api_name.txt" || filename == "/wigle_api_token.txt") continue;
 
                         //Get the bootcount (numerical) part of a filename, for WiGLE references later.
                         String filename_id = "";
@@ -1798,9 +1635,12 @@ void boot_config(){
                           client.print("<p><a href=\"/delete?fn=");
                           client.print(filename);
                           client.print("\">");
-                          client.print("Delete</a></p><p><a href=\"/upload?fn=");
+                          client.print("\">Delete</a></p>");
+                        }
+                        if (!created_network && session_upload::isSession(filename)){
+                          client.print("<p><a href=\"/upload?fn=");
                           client.print(filename);
-                          client.print("\">Upload</a>");
+                          client.print("\">Upload session</a></p>");
                         }
                         client.println("</td></tr>");
                       }
@@ -1877,7 +1717,7 @@ void boot_config(){
                     client.println();
                     client.print("<style>html{font-size:21px;text-align:center;padding:20px}input[type=text],input[type=password],input[type=submit],select{padding:5px;width:100%;max-width:1000px}form{padding-top:10px}br{display:block;margin:5px 0}</style>");
                     client.print("<html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"><h2>WiGLE Configuration</h2>");
-                    client.print("<p>Your device can upload captured data directly to WiGLE. Please provide a WiGLE API key below. This can be found at https://wigle.net/account</p>");
+                    client.print("<p>Set WiGLE API name and token on the SD card as wigle_api_name.txt and wigle_api_token.txt. These take priority over the legacy encoded credential below.</p>");
                     if (wigle_api_key.length() > 2){
                       client.print("<p>An API key is already set. Leave the value as 'configured' unless you wish to change it.</p>");
                     }
@@ -2110,38 +1950,54 @@ void boot_config(){
                     }
                   }
 
-                  if (buff.indexOf("GET /upload?") > -1) {
-                    int startpos = buff.indexOf("?fn=")+4;
-                    int endpos = buff.indexOf(" ",startpos);
-                    String filename = buff.substring(startpos,endpos);
-                    ESP_LOGD(LOG_TAG_GENERIC, "File upload request for %s", filename.c_str());
-                    if (!SD.exists(filename)){
-                      ESP_LOGW(LOG_TAG_GENERIC, "File upload request, but file does not exist: %s", filename.c_str());
-                      client.println("Content-type: text/html");
-                      client.println();
-                      client.print("<h1>File not found </h1>");
-                      client.println("<meta http-equiv=\"refresh\" content=\"1; URL=/\" />");
+                  if (buff.startsWith("GET /upload?fn=") || buff.startsWith("POST /upload?fn=")) {
+                    const bool submit = buff.startsWith("POST ");
+                    const int startpos = submit ? sizeof("POST /upload?fn=") - 1 : sizeof("GET /upload?fn=") - 1;
+                    const int endpos = buff.indexOf(' ', startpos);
+                    String query = buff.substring(startpos, endpos);
+                    int separator = query.indexOf('&');
+                    String filename = separator < 0 ? query : query.substring(0, separator);
+                    client.println("Content-Type: text/html; charset=UTF-8");
+                    client.println("Cache-Control: no-store");
+                    client.println();
+                    client.print("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><h1>Upload session</h1>");
+                    if (created_network || WiFi.status() != WL_CONNECTED) {
+                      client.print("<p>Connect Wispier to your saved Wi-Fi for uploads.</p>");
+                    } else if (!session_upload::isSession(filename) || !SD.exists(filename)) {
+                      client.print("<p>Saved Wispier session not found.</p>");
+                    } else if (!submit) {
+                      const char *labels[] = {"WiGLE", "WDGWars", "WarDrift"};
+                      for (int service = 0; service < 3; service++){
+                        client.print("<form method=\"post\" action=\"/upload?fn=" + filename +
+                                     "&amp;to=" + String(service) + "&amp;nonce=" + uploadNonce + "\">");
+                        client.print("<p><button type=\"submit\">Upload to " + String(labels[service]) +
+                                     "</button></p></form>");
+                      }
+                      client.print("<p>Uploading shares network observations and recorded locations with the selected service.</p>");
                     } else {
-                      client.println("Content-type: text/html");
-                      client.println();
-                      client.print("<style>html,td,th{font-size:21px;text-align:center;padding:20px}</style><html>");
-                      client.print("<h1>Uploading");
-                      client.print(filename);
-                      client.print("</h1><h2>Check LCD for progress");
-                      client.print("</h2>Once complete, <a href=\"/\">click here</a> to continue.</html>");
-                      client.flush();
-                      delay(5);
-                      client.stop();
-                      boolean success = wigle_upload(filename);
-                      if (success == true){
-                        ESP_LOGD(LOG_TAG_GENERIC, "File upload complete");
+                      int destination = -1;
+                      for (int service = 0; service < 3; service++){
+                        if (query == filename + "&to=" + String(service) + "&nonce=" + uploadNonce) destination = service;
+                      }
+                      if (destination < 0) {
+                        client.print("<p>Invalid upload selection. Reopen the session to try again.</p>");
+                      } else {
                         clear_display();
-                        display.println("Uploaded OK");
+                        display.println("Uploading session");
                         display.display();
-                        delay(1000);
-                        wigle_load_history();
+                        String result = session_upload::upload(filename, static_cast<session_upload::Destination>(destination),
+                                                               generate_filename(filename), wigle_api_key, wigle_commercial);
+                        client.print("<p>" + html_escape(result) + "</p>");
+                        clear_display();
+                        display.println(result);
+                        display.display();
+                        delay(1200);
+                        if (destination == session_upload::WIGLE && result == "Accepted by WiGLE for processing"){
+                          wigle_load_history();
+                        }
                       }
                     }
+                    client.print("<p><a href=\"/\">Back to sessions</a></p>");
                   }
 
                   if (buff.indexOf("GET /delete?") > -1) {
