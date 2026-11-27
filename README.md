@@ -2,7 +2,7 @@
 
 Updated Wispier/Signal Sleuth firmware for Rob's **HackerBox 0115 Wispier**.
 
-**Development foundation, not a tested firmware release.** This repository now contains both ESP32 sketches based on Joseph Hewitt's wardriver_rev3. Dual-service uploads and Flock/Axon detection are planned; they are not implemented yet.
+**Development firmware.** Both ESP32 sketches are based on Joseph Hewitt’s wardriver_rev3. Side A can upload saved sessions to WiGLE, WDGWars, and WarDrift. See [upload setup](docs/uploads.md).
 
 ## Hardware
 Two ESP32-WROOM-32U modules, BW16 RTL8720DN, ATGM336H GPS, microSD, 128×32 I2C OLED, and DS18B20. This target is the HackerBox PCB, not a generic ESP32-C5 or a different Signal Sleuth revision.
@@ -18,7 +18,7 @@ Two ESP32-WROOM-32U modules, BW16 RTL8720DN, ATGM336H GPS, microSD, 128×32 I2C 
 These changes do **not** establish the cause of the reported invalid-token error. The legacy uploader still expects WiGLE's full **Encoded for use** credential and uses a CA file on SD. Its authentication UI and transport need further work.
 
 ## Layout
-- `A/A.ino`: GPS, SD logging, OLED, Wi-Fi scanning, web interface, legacy WiGLE uploader.
+- `A/A.ino`: GPS, SD logging, OLED, Wi-Fi scanning, web interface, three-destination session uploads.
 - `B/B.ino`: BLE/Wi-Fi scanning, temperature, BW16 communication.
 - `boards.txt`, `libraries.txt`: upstream-pinned Arduino dependencies.
 - [Hardware notes](docs/hardware.md)
@@ -33,4 +33,3 @@ A GitHub Actions workflow compiles both ESP32 sketches. A successful compilation
 
 ## Credits and license
 Based on [JosephHewitt/wardriver_rev3](https://github.com/JosephHewitt/wardriver_rev3), with its GPL-3.0 license and author notices retained. BW16 companion: [CoD-Segfault/BW16-Open-AT](https://github.com/CoD-Segfault/BW16-Open-AT). Hardware: [HackerBox 0115](https://hackerboxes.com/products/hackerbox-0115-wispier). Signal Sleuth inspiration: [463N7](https://github.com/463N7/SignalSleuth).
-
