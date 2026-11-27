@@ -12,10 +12,9 @@ Two ESP32-WROOM-32U modules, BW16 RTL8720DN, ATGM336H GPS, microSD, 128×32 I2C 
 - Default temperature display to Fahrenheit (cfg.txt can override).
 - Trim WiGLE credential whitespace on save and load.
 - Fix upload-history lookup to compare both file ID and file size.
-- Zero-initialize WiGLE PEM buffers to preserve their terminating NUL.
 - Disable upstream automatic OTA selection for this fork.
 
-These changes do **not** establish the cause of the reported invalid-token error. The legacy uploader still expects WiGLE's full **Encoded for use** credential and uses a CA file on SD. Its authentication UI and transport need further work.
+WiGLE accepts its API name and token from SD or the previously saved encoded credential. See the upload setup for credential and CA file names.
 
 ## Layout
 - `A/A.ino`: GPS, SD logging, OLED, Wi-Fi scanning, web interface, three-destination session uploads.
