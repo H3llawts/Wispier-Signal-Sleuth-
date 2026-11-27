@@ -49,9 +49,9 @@ static String wigleCredential(const String &legacy) {
   String pair = name + ":" + token;
   unsigned char encoded[689];
   size_t length = 0;
-  if (mbedtls_base64_encode(encoded, sizeof(encoded),
+  if (mbedtls_base64_encode(encoded, sizeof(encoded), &length,
                            reinterpret_cast<const unsigned char *>(pair.c_str()),
-                           pair.length(), &length) != 0) return "";
+                           pair.length()) != 0) return "";
   return String(reinterpret_cast<const char *>(encoded));
 }
 
